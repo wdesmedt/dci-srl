@@ -32,7 +32,7 @@ configuration is the same for both.
 - **WAN core**: 2 P/PE routers (7250 IXR-X3b)
 - **Clients**: 6 `network-multitool` containers (2 multi-homed + 1 single-homed per DC)
 
-![DCI topology: two EVPN-VXLAN datacenters (DC1 192.0.2.0/24, DC2 192.0.3.0/24), each with 4 leaves / 2 spines / 2 DCGWs, interconnected by a DCGW direct full-mesh and a 2-router MPLS WAN core](dci-without-eda.clab.svg)
+![DCI topology: two EVPN-VXLAN datacenters (DC1 192.0.2.0/24, DC2 192.0.3.0/24), each with 4 leaves / 2 spines / 2 DCGWs, interconnected by a DCGW direct full-mesh and a 2-router MPLS WAN core](dci-srl.svg)
 
 Client attachment (each DC has **two** independent all-active Ethernet-Segments plus a
 single-homed client, giving enough flows to hash DCI traffic across both gateways):
