@@ -1,0 +1,6 @@
+pytest>=8.0
+
+# Control-plane tests (test_control_plane_established, test_remote_dest_via_local_dcgw)
+# use `fcli` for fabric-wide BGP/RIB state over gNMI. It is NOT a pip dependency -
+# install separately (e.g. `pipx install nornir-srl`); those tests skip gracefully
+# if `fcli` is not on PATH. Data-plane tests only need docker + a deployed lab.
