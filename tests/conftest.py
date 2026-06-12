@@ -30,7 +30,7 @@ _TRACE = os.environ.get("DCI_TRACE")
 import pytest
 
 # containerlab topology that defines this lab (resolved so fcli works from any cwd)
-CLAB_TOPO = Path(__file__).resolve().parent.parent / "dci-without-eda.clab.yaml"
+CLAB_TOPO = Path(__file__).resolve().parent.parent / "dci-srl.clab.yaml"
 
 # --------------------------------------------------------------------------- #
 # Topology facts (kept in one place so tests stay declarative)
