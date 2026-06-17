@@ -202,7 +202,7 @@ set / interface irb0 subinterface 0 ipv4 arp evpn advertise dynamic interface-le
 set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment <es> advertise-ifl-host-ad-routes
 ```
 
-`arp evpn advertise dynamic interface-less-routing` advertises each learned ARP/ND entry in an EVPN MAC/IP route that also carries the **IP-VRF interface-less label + route-target** (no `bgp-evpn-instance` needed — instance `1` is the default), so every *other* leaf and DCGW in the host's DC installs a `bgp-evpn-ifl-host` **`/32`** (`/128`) pointing *directly* at the owning leaf's VTEP — no trombone through the anycast `/24`. (The leaves the host is attached to don't need a `/32`: they reach it via the connected `/24` + local ARP.) On a **multi-homed** ES, `advertise-ifl-host-ad-routes` makes **both** ES leaves originate the IFL host route, so the `/32` resolves via **both** their VTEPs (e.g. `10.200.2.21/32 -> [192.0.3.15, 192.0.3.16]`) — inter-subnet traffic to the host is load-balanced across the ES (IP-aliasing). This replaces the earlier `arp host-route populate dynamic` model, which produced only a single-next-hop `/32`.
+`arp evpn advertise dynamic interface-less-routing` advertises each learned ARP/ND entry in an EVPN MAC/IP route that also carries the **IP-VRF interface-less label + route-target** (no `bgp-evpn-instance` needed — instance `1` is the default), so every *other* leaf and DCGW in the host's DC installs a `bgp-evpn-ifl-host` **`/32`** (`/128`) pointing *directly* at the owning leaf's VTEP — no trombone through the anycast `/24`. (The leaves the host is attached to don't need a `/32`: they reach it via the connected `/24` + local ARP.) On a **multi-homed** ES, the IFL host route (the `/32`) is originated by just **one** of the ES leaves — but it carries the segment's **ESI**. `advertise-ifl-host-ad-routes` makes **both** ES leaves emit an EVPN **Auto-Discovery per-EVI (Type-1 AD-per-EVI)** route for that segment, so every remote leaf/DCGW *aliases* the single host `/32` onto **both** their VTEPs (e.g. `10.200.2.21/32 -> [192.0.3.15, 192.0.3.16]`) — inter-subnet traffic to the host is then load-balanced across the ES. This is EVPN **aliasing** (per [`draft-ietf-bess-evpn-aliasing`](https://datatracker.ietf.org/doc/draft-ietf-bess-evpn-aliasing/) / RFC 7432 §8.4): the load-balancing comes from the per-EVI A-D routes, **not** from both leaves re-advertising the host route.
 
 For **control-plane scaling**, those host-routes must **not** cross the DCI: the IFL host routes carry the VXLAN tunnel-encap community and are dropped on `dcgw-wan-export-dcX` (statement `10`), and as defense-in-depth statement `8` also rejects the `host-routes-l3dci` prefix-set (`10.200.0.0/16` `mask-length-range 32..32`, plus `::/0` `128..128`) on the `l3vpn` families. The remote DC therefore carries only the covering `/24`, while the local DCGWs and leaves keep the precise (aliased) `/32`s. Verified by `tests/test_dci.py::test_l3_host_route_scoped_to_local_dc` (via `fcli ipv4-rib`): the host `/32` is active on every *non-attached* node of its own DC (multi-homed hosts via both ES VTEPs) and absent — even as a non-best path — on every node of the remote DC, which holds only the `/24`.
 
@@ -215,14 +215,14 @@ For **control-plane scaling**, those host-routes must **not** cross the DCI: the
 > The 7220 leaves/spines need no license.
 
 ```bash
-cd validated-designs/dci/dci-without-eda
-sudo containerlab deploy -t dci-without-eda.clab.yaml
+# From repository root (same directory as dci-srl.clab.yaml)
+sudo containerlab deploy -t dci-srl.clab.yaml
 ```
 
 Destroy / redeploy:
 
 ```bash
-sudo containerlab destroy -t dci-without-eda.clab.yaml --cleanup
+sudo containerlab destroy -t dci-srl.clab.yaml --cleanup
 ```
 
 Give the fabric ~2–3 minutes to converge (eBGP, IS-IS/LDP, iBGP, EVPN, then client
@@ -243,13 +243,13 @@ nodes** (8 leaves, 4 spines, 4 DCGWs, 2 P routers) and returns one consolidated 
 you see the whole fabric at a glance instead of scraping `show ...` on 18 boxes.
 
 ```bash
-cd validated-designs/dci/dci-without-eda      # so the topology file is in reach
+# From repository root (same directory as dci-srl.clab.yaml)
 
 # Scope to a subset with the inventory filter (-i) using the topology labels:
 #   role = leaf | spine | dcgw | pe        site = dc1 | dc2 | wan
-fcli -t dci-without-eda.clab.yaml bgp-peers                 # all nodes
-fcli -t dci-without-eda.clab.yaml -i role=dcgw bgp-peers    # just the four DCGWs
-fcli -t dci-without-eda.clab.yaml -o json vxlan | jq .      # machine-readable
+fcli -t dci-srl.clab.yaml bgp-peers                 # all nodes
+fcli -t dci-srl.clab.yaml -i role=dcgw bgp-peers    # just the four DCGWs
+fcli -t dci-srl.clab.yaml -o json vxlan | jq .      # machine-readable
 ```
 
 | Want to verify | `fcli` command | Notes |
@@ -578,14 +578,14 @@ same tool the reference lab uses). The editable source artifacts are kept under
 ```bash
 # 1) draw.io diagram + flow-panel dashboard JSON + mapping (P->DCGW->spine->leaf->client)
 docker run --rm -v "$PWD":/data --entrypoint clab2drawio ghcr.io/srl-labs/clab-io-draw \
-  -i /data/dci-without-eda.clab.yaml -g --theme nokia
+  -i /data/dci-srl.clab.yaml -g --theme nokia
 # 2) render the .drawio to SVG
 docker run --rm -v "$PWD":/data rlespinasse/drawio-desktop-headless \
-  -x -f svg -o /data/dci-without-eda.clab.svg /data/dci-without-eda.clab.drawio
+  -x -f svg -o /data/dci-srl.svg /data/dci-srl.clab.drawio
 # 3) make the SVG flow-panel-compatible, then inline it into the panel's "svg" option
 python3 - <<'PY'
 import re, json
-svg = open("dci-without-eda.clab.svg").read()
+svg = open("dci-srl.svg").read()
 svg = svg.replace(' data-cell-id="', ' id="cell-')   # plugin matches id="cell-<name>"
 svg = re.sub(r'\s+style="[^"]*"', '', svg)            # drop color-scheme/light-dark() (renders black on dark theme)
 svg = svg.replace('stroke="#000000"', 'stroke="#98a2ae"').replace('fill="#000000"', 'fill="#c7d0d9"').replace('fill="#ffffff"', 'fill="none"')
@@ -604,7 +604,7 @@ PY
 > swaps those colors for the light-grey palette the reference lab uses.
 
 ```bash
-cd validated-designs/dci/dci-without-eda
+# From repository root (same directory as dci-srl.clab.yaml)
 sudo containerlab deploy -t dci-without-eda-with-tm.clab.yaml
 # Grafana: http://localhost:3000 (anonymous admin)  ·  Prometheus: http://localhost:9090
 ```
@@ -628,8 +628,9 @@ Destroy with `sudo containerlab destroy -t dci-without-eda-with-tm.clab.yaml --c
 - **L2 vs L3 gateway load-sharing**: **L3 DCI** (EVPN-IFL / IP-VPN) is active/active —
   the remote subnet resolves via both DCGWs as ECMP next-hops, so flows hash across both
   (verified by the `ecmp` test). Inside a DC, traffic to a **multi-homed** L3 host is in
-  turn load-balanced across both ES leaves via `advertise-ifl-host-ad-routes` (IP-aliasing
-  on the `bgp-evpn-ifl-host` `/32`; see *L3 host-routes* above and the
+  turn load-balanced across both ES leaves via `advertise-ifl-host-ad-routes` (EVPN
+  aliasing — both leaves advertise per-EVI A-D routes so remote nodes resolve the single
+  `bgp-evpn-ifl-host` `/32` over both VTEPs; see *L3 host-routes* above and the
   `test_l3_host_route_scoped_to_local_dc` test). **L2 DCI** uses the documented anycast model (shared RD
   + `inclusive-mcast originating-ip`): leaves receive equivalent MAC routes from both
   gateways and BGP selects **one** (active/standby for unicast, active/active for BUM).
