@@ -174,11 +174,47 @@ Both services bind **one** tenant network-instance to **two** BGP instances:
   - the DCGW pair in each DC is **anycast**: identical per-instance RD + `inclusive-mcast originating-ip` (`192.0.2.150` / `192.0.3.150`)
   - a second stretched bridge-domain `macvrf-l2dci-b` (VLAN 110, RT `110:110` / `65000:110`, originating-ip `…:.150`) provides per-service gateway load-sharing, pinned to dcgw2/dcgw4 on both DCI planes (see above)
 
-**Loop prevention — SOO policy (applies to both L2 and L3, RFC 9014 / interworking style):**
+**Domain separation — internal route tags (encapsulation-independent):**
 
-- **DC → WAN** export (`dcgw-wan-export-dcX`) drops EVPN routes that carry the VXLAN tunnel-encap community (so DC-origin routes never leak end-to-end across the WAN — this is the filter that keeps a remote leaf's VXLAN route from reaching the far DC), and **adds the per-DC SOO** (`soo-dc1` = `origin:65000:1`, `soo-dc2` = `origin:65000:2`) to everything it does send
-- **WAN → DC** re-origination (`dcgw-dc-export-dcX`) drops EVPN routes carrying the MPLS tunnel-encap community and stamps the local SOO on every route it injects into the fabric
-- both import policies (`dcgw-wan-import-dcX`, `dcgw-dc-import-dcX`) **default-reject** and explicitly **drop routes carrying the local SOO** before accepting the required families (`evpn`, `l3vpn-ipv4-unicast` on the WAN; `evpn`, `ipv4/ipv6-unicast` on the fabric) — so a route a DCGW originated can never be re-imported by its peer gateway and re-injected, closing the stitching loop
+Each DCGW runs its DC-facing and DCI-facing BGP instances inside the *same* tenant
+network-instance, so its default-instance BGP RIB holds both the raw DC routes (RT
+`100:100` / `3000:3000`) and the raw WAN routes (RT `65000:100` / `65000:3000`). Left
+unfiltered, ordinary BGP would re-advertise a raw DC route straight from the eBGP fabric
+onto the iBGP WAN mesh (and vice-versa) — bypassing the stitch. To pin each domain's
+routes to its own session, routes are marked with a **route internal tag** (`tag-1` = DC
+side, `tag-2` = WAN/DCI side) and the session **export** policies drop the wrong tag:
+
+- DC-side routes are tagged `tag-1` — both by the DC-facing `bgp-evpn bgp-instance`
+  (which tags the *re-originated/stitched* copy it generates) **and** by the fabric
+  import policy `dcgw-dc-import-dcX` (which tags the *raw received* copy that BGP could
+  otherwise transit onto the WAN). `dcgw-wan-export-dcX` (statement 10) drops `tag-1`,
+  so no DC route — stitched or transit — escapes onto the WAN; only the WAN instance's
+  freshly re-originated copy (`tag-2`) is sent. This is the filter that keeps a remote
+  leaf's DC route from reaching the far DC unstitched.
+- WAN-side routes are tagged `tag-2` — by the WAN-facing instance **and** the WAN import
+  policy `dcgw-wan-import-dcX`. `dcgw-dc-export-dcX` (statement 10) drops `tag-2`, so a
+  raw WAN route is never re-advertised back onto the fabric.
+
+Internal tags (rather than a `bgp-tunnel-encap` community match) are used **on purpose**:
+the separation is then independent of the encapsulation-type. Today the DC side is VXLAN
+and the DCI side is MPLS, but a planned iteration runs **VXLAN on both** the DC and the
+DCI — where a tunnel-encap match could no longer distinguish the two instances, while the
+tag-based policies keep working unchanged.
+
+**Loop prevention — per-DC SOO (RFC 9014 / interworking style, applies to both L2 and L3):**
+
+- every route a DCGW sends — to the WAN (`dcgw-wan-export-dcX`) or into the fabric
+  (`dcgw-dc-export-dcX`) — is stamped with the per-DC SOO (`soo-dc1` = `origin:65000:1`,
+  `soo-dc2` = `origin:65000:2`)
+- both import policies (`dcgw-wan-import-dcX`, `dcgw-dc-import-dcX`) **default-reject** and
+  explicitly **drop routes carrying the local SOO** before accepting the required families
+  (`evpn`, `l3vpn-ipv4-unicast` on the WAN; `evpn`, `ipv4/ipv6-unicast` on the fabric) — so
+  a route one DCGW originated can never be re-imported by its **peer gateway in the same
+  DC** and re-injected, closing the stitching loop
+- the SOO carries the *originating DC's* identity, so it stops the local re-injection loop
+  but does **not** by itself stop a raw DC route from transiting to the *far* DC (whose
+  gateways reject only their own SOO) — that cross-domain leak is what the internal-tag
+  separation above prevents. The two mechanisms are complementary, not redundant.
 
 **Loop prevention — D-PATH for L3 DCI (recommended for multi-instance IP-VRF):**
 
@@ -204,7 +240,7 @@ set / system network-instance protocols evpn ethernet-segments bgp-instance 1 et
 
 `arp evpn advertise dynamic interface-less-routing` advertises each learned ARP/ND entry in an EVPN MAC/IP route that also carries the **IP-VRF interface-less label + route-target** (no `bgp-evpn-instance` needed — instance `1` is the default), so every *other* leaf and DCGW in the host's DC installs a `bgp-evpn-ifl-host` **`/32`** (`/128`) pointing *directly* at the owning leaf's VTEP — no trombone through the anycast `/24`. (The leaves the host is attached to don't need a `/32`: they reach it via the connected `/24` + local ARP.) On a **multi-homed** ES, the IFL host route (the `/32`) is originated by just **one** of the ES leaves — but it carries the segment's **ESI**. `advertise-ifl-host-ad-routes` makes **both** ES leaves emit an EVPN **Auto-Discovery per-EVI (Type-1 AD-per-EVI)** route for that segment, so every remote leaf/DCGW *aliases* the single host `/32` onto **both** their VTEPs (e.g. `10.200.2.21/32 -> [192.0.3.15, 192.0.3.16]`) — inter-subnet traffic to the host is then load-balanced across the ES. This is EVPN **aliasing** (per [`draft-ietf-bess-evpn-aliasing`](https://datatracker.ietf.org/doc/draft-ietf-bess-evpn-aliasing/) / RFC 7432 §8.4): the load-balancing comes from the per-EVI A-D routes, **not** from both leaves re-advertising the host route.
 
-For **control-plane scaling**, those host-routes must **not** cross the DCI: the IFL host routes carry the VXLAN tunnel-encap community and are dropped on `dcgw-wan-export-dcX` (statement `10`), and as defense-in-depth statement `8` also rejects the `host-routes-l3dci` prefix-set (`10.200.0.0/16` `mask-length-range 32..32`, plus `::/0` `128..128`) on the `l3vpn` families. The remote DC therefore carries only the covering `/24`, while the local DCGWs and leaves keep the precise (aliased) `/32`s. Verified by `tests/test_dci.py::test_l3_host_route_scoped_to_local_dc` (via `fcli ipv4-rib`): the host `/32` is active on every *non-attached* node of its own DC (multi-homed hosts via both ES VTEPs) and absent — even as a non-best path — on every node of the remote DC, which holds only the `/24`.
+For **control-plane scaling**, those host-routes must **not** cross the DCI: the IFL host routes are DC-side EVPN routes tagged `tag-1` and are dropped on `dcgw-wan-export-dcX` (statement `10`, the same DC-side internal-tag filter described above), and as defense-in-depth statement `8` also rejects the `host-routes-l3dci` prefix-set (`10.200.0.0/16` `mask-length-range 32..32`, plus `::/0` `128..128`) on the `l3vpn` families. The remote DC therefore carries only the covering `/24`, while the local DCGWs and leaves keep the precise (aliased) `/32`s. Verified by `tests/test_dci.py::test_l3_host_route_scoped_to_local_dc` (via `fcli ipv4-rib`): the host `/32` is active on every *non-attached* node of its own DC (multi-homed hosts via both ES VTEPs) and absent — even as a non-best path — on every node of the remote DC, which holds only the `/24`. When `fcli bgp-rib -r l3vpn-v4` is supported, the same test also checks the host `/32` is absent from the **WAN VPNv4** RIB on the remote DC's DCGWs.
 
 ---
 
@@ -215,7 +251,6 @@ For **control-plane scaling**, those host-routes must **not** cross the DCI: the
 > The 7220 leaves/spines need no license.
 
 ```bash
-# From repository root (same directory as dci-srl.clab.yaml)
 sudo containerlab deploy -t dci-srl.clab.yaml
 ```
 
@@ -226,7 +261,7 @@ sudo containerlab destroy -t dci-srl.clab.yaml --cleanup
 ```
 
 Give the fabric ~2–3 minutes to converge (eBGP, IS-IS/LDP, iBGP, EVPN, then client
-bootstrap). Inspect a node with `ssh admin@clab-dci-nvd-without-eda-leaf1` (password
+bootstrap). Inspect a node with `ssh admin@clab-dci-srl-leaf1` (password
 `NokiaSrl1!`).
 
 ---
@@ -243,7 +278,7 @@ nodes** (8 leaves, 4 spines, 4 DCGWs, 2 P routers) and returns one consolidated 
 you see the whole fabric at a glance instead of scraping `show ...` on 18 boxes.
 
 ```bash
-# From repository root (same directory as dci-srl.clab.yaml)
+# from the repo root (where dci-srl.clab.yaml lives)
 
 # Scope to a subset with the inventory filter (-i) using the topology labels:
 #   role = leaf | spine | dcgw | pe        site = dc1 | dc2 | wan
@@ -254,25 +289,27 @@ fcli -t dci-srl.clab.yaml -o json vxlan | jq .      # machine-readable
 
 | Want to verify | `fcli` command | Notes |
 |----------------|----------------|-------|
-| Underlay + overlay BGP up | `bgp-peers` | eBGP fabric + iBGP WAN; all `established` |
+| Underlay + overlay BGP up | `bgp-peers` | eBGP fabric + iBGP WAN; all `established`. Table uses two-line AFI headers (e.g. **EVPN** / **R/A/T**); with ``-o json`` keys become ``EVPN R/A/T``, ``U4 R/A/T``, ``VPNv4 R/A/T``, … (received / active / sent per neighbor). |
 | EVPN control plane | `bgp-rib -r evpn` (`-t 2` MAC/IP, `-t 5` IP-prefix) | fabric-wide route/next-hop view |
 | VXLAN tunnels / VTEPs | `vxlan` | per-leaf VTEP unicast destinations |
 | L2 services + MACs | `ni -f Type=mac-vrf`, `mac` | stretched BD-A/BD-B reachability |
 | L3 services + hosts | `ni -f Type=ip-vrf`, `irb`, `ipv4-rib`, `arp` | IP-VRF, anycast IRB, IFL `/32`s |
 | Multi-homing | `es`, `es-dest`, `lag` | all-active ES state + LACP bundles |
 | WAN underlay | `-i site=wan lldp`, `ipv4-rib` | IS-IS/MPLS core adjacencies |
-| Live link rates | `ifstats -s 10` | per-interface in/out bps |
+| MPLS transport / tunnels | `tunnel-table` | parallel LDP vs SR-ISIS tunnels + egress port/labels |
+| Live link rates / counters | `ifstats -s 10` | per-interface in/out bps **and** cumulative pkts/octets |
 
 **When per-node `show` is better — and why the steps below still use it.** `fcli`
 reports SR Linux *state* models, but a few DCI-specific checks need detail it does not
-surface, so for those reach into a single node with `ssh admin@clab-dci-nvd-without-eda-<node>`
+surface, so for those reach into a single node with `ssh admin@clab-dci-srl-<node>`
 (or `docker exec -i <node> sr_cli`):
 
-- **MPLS transport / tunnel-table** — `show network-instance default tunnel-table all`
-  shows the parallel **LDP vs SR-ISIS** tunnels and their preference (sections 0, 3–5);
-  `fcli` has no tunnel-table view.
+- **MPLS transport / tunnel-table** — `fcli tunnel-table` now gives the fabric-wide view of
+  the parallel **LDP vs SR-ISIS** tunnels (preference, egress port, label stack); for the
+  per-node preference detail of sections 0, 3–5 you can still use
+  `show network-instance default tunnel-table all`.
 - **IS-IS adjacencies, LDP sessions, segment-routing / node-SIDs** — the WAN-core IGP and
-  label state (section 0, 5).
+  label state (section 0, 5); `fcli` has no view of these.
 - **Service route-table specifics** — e.g. `show network-instance ipvrf-l3dci route-table
   ipv4-unicast` to see which transport/next-hop a remote prefix resolved over.
 - **Making changes** — fault injection and restores (`enter candidate` / `commit now`) are
@@ -295,8 +332,8 @@ Stretched bridge-domain — a single subnet 10.100.0.0/24 across both DCs.
 
 ```bash
 # DC1 logical client -> DC2 logical client (same subnet, pure L2)
-docker exec clab-dci-nvd-without-eda-mh-dc1 ip netns exec mh1-l2a ping 10.100.0.21
-docker exec clab-dci-nvd-without-eda-sh-dc1 ip netns exec sh1-l2  ping 10.100.0.23
+docker exec clab-dci-srl-mh-dc1 ip netns exec mh1-l2a ping 10.100.0.21
+docker exec clab-dci-srl-sh-dc1 ip netns exec sh1-l2  ping 10.100.0.23
 ```
 On a DCGW: `show network-instance macvrf-l2dci bridge-table mac-table all` shows remote
 MACs reachable via the EVPN-MPLS (instance 2) next-hop, resolved over the **direct**
@@ -307,8 +344,8 @@ mesh (low IS-IS metric).
 Different subnet per DC, routed across the DCI via `ipvrf-l3dci`.
 
 ```bash
-docker exec clab-dci-nvd-without-eda-mh-dc1 ip netns exec mh1-l3a ping 10.200.2.21
-docker exec clab-dci-nvd-without-eda-sh-dc1 ip netns exec sh1-l3  ping 10.200.2.23
+docker exec clab-dci-srl-mh-dc1 ip netns exec mh1-l3a ping 10.200.2.21
+docker exec clab-dci-srl-sh-dc1 ip netns exec sh1-l3  ping 10.200.2.23
 ```
 On a DCGW: `show network-instance ipvrf-l3dci route-table ipv4-unicast` shows the remote
 DC subnet learned via IP-VPN; `show network-instance default protocols bgp routes
@@ -381,10 +418,22 @@ drives the running lab over `docker exec`. It covers steady-state L2/L3 connecti
 multiple hashed iperf3 flows**, and a **diagonal double-gateway failure** (one DCGW per
 DC). Every test that injects a fault restores the topology in teardown.
 
+The suite uses **`fcli`** for fabric-wide gNMI reports (`bgp-peers`, BGP RIBs including
+EVPN and—when supported—**L3VPN IPv4** in the WAN `default` instance, `ipv4-rib` in
+`ipvrf-l3dci`, `tunnel-table`, `ifstats`). Extra DCGW VPNv4 assertions are skipped
+automatically if `fcli bgp-rib -r l3vpn-v4` is not available (older nornir-srl builds).
+
 ```bash
 cd tests
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
+
+# fcli is a REQUIRED prerequisite (fabric-wide reporting over gNMI), not a pip
+# dependency. Needs >= 0.4.3 (first release with the tunnel-table report).
+# Optional: a current nornir-srl build adds `fcli bgp-rib -r l3vpn-v4` for WAN
+# VPNv4 RIB checks on DCGWs (the suite skips those if the mode is missing).
+# Install it once as a standalone tool with uv (https://docs.astral.sh/uv/):
+uv tool install --force git+https://github.com/srl-labs/nornir-srl   # ensure ~/.local/bin is on PATH
 
 pytest -v                      # full suite (deploy the lab first)
 pytest -v -m connectivity      # steady-state + control-plane only (non-disruptive)
@@ -393,17 +442,97 @@ pytest -v -m "not disruptive"  # everything except fault injection
 pytest -v -m convergence -s    # WAN/transport failover, GW redundancy + diagonal double failure
 ```
 
+### pytest-html: per-test log output (optional)
+
+Install (included in `requirements.txt`): **`pytest-html`** (and **`pytest-metadata`** for the
+environment table). Build a self-contained report with:
+
+```bash
+pytest -v --html=report.html --self-contained-html
+```
+
+**Why the “Log” section is empty:** pytest-html fills it from **captured** stdout/stderr
+(and pytest’s captured logging). If you pass **`-s`** or **`--capture=no`**, capture is
+disabled and the HTML report has nothing to show per test.
+
+**Fix while still watching output on the terminal:** use **`--capture=tee-sys`** instead
+of `-s`. Output is copied to both the console and the capture buffer, so the HTML log is
+populated. Example (same markers as above, trace-friendly for `DCI_TRACE`):
+
+```bash
+DCI_TRACE=1 pytest -v -m convergence --capture=tee-sys --html=report.html --self-contained-html
+```
+
+**Python `logging` in tests or helpers:** pass a capture level so pytest records log lines
+into the report (especially useful on failures), e.g. **`--log-level=INFO`** or
+**`--log-level=DEBUG`** on the same command line (or set `log_level` under `[pytest]` in
+`pytest.ini` if you want that for every run).
+
+**Custom snippets** (screenshots, JSON blobs): in a test or fixture, use the
+[extras API](https://pytest-html.readthedocs.io/en/latest/user_guide.html#extras) via
+`import pytest_html` and `pytest_html.extras.text(...)` / `.json(...)` / `.html(...)`, or
+register a
+[`pytest_runtest_makereport`](https://docs.pytest.org/en/stable/reference/reference.html#pytest-runtest-makereport)
+hook and append to `report.extra`.
+
+### Allure reports (optional)
+
+The test venv includes **`allure-pytest`**, which writes raw results when you pass
+`--alluredir`. Turning that into the HTML UI needs two things **outside** the Python venv:
+
+1. **Java 8+** on `PATH` (the Allure CLI is a Java app). If `java -version` fails, install
+   a JRE first, e.g. on Debian/Ubuntu: `sudo apt install openjdk-17-jre-headless`.
+2. The **Allure command-line** package ([install options](https://docs.qameta.io/allure-report/#_installing_a_commandline)).
+   With Node/npm: `npm install -g allure-commandline`, then ensure the global npm `bin`
+   directory is on `PATH` (for [nvm](https://github.com/nvm-sh/nvm) that is typically
+   `…/nvm/versions/node/<version>/bin`). Other options: [SDKMAN](https://sdkman.io/)
+   `sdk install allure`, or [Homebrew](https://brew.sh/) `brew install allure`.
+
+Check both: `java -version` and `allure --version`.
+
+From `tests/` (after `pip install -r requirements.txt`):
+
+```bash
+# 1) Run pytest and capture Allure data (add your usual -m … filters as needed)
+pytest -v --alluredir=allure-results
+
+# 2a) Quick view: starts a local web server and opens the report (ephemeral)
+allure serve allure-results
+
+# 2b) Static report on disk (good for CI artifacts or sharing)
+allure generate allure-results -o allure-report --clean
+allure open allure-report
+```
+
+`allure-results/` and `allure-report/` are gitignored under `tests/`. Re-run step 1
+whenever you want a fresh report; use `--clean` on `generate` so old pages are not mixed
+with a new run.
+
+To attach **per-test text or files** in Allure (stdout dumps, JSON, screenshots), use
+`import allure` and `allure.attach(body, name="…", attachment_type=allure.attachment_type.TEXT)`
+(or `allure.attach.file(...)`) inside the test or a fixture.
+
 What the markers map to:
 
-- `connectivity` — all DCGW BGP sessions established, the DIRECT mesh is the preferred
+- `connectivity` — all DCGW BGP sessions established with non-zero **received / active / sent**
+  route counts on the AFIs each peer-group actually runs (per DCGW+group, not all peers
+  may carry traffic, but **not** every peer in the group may be at zero — that flags a
+  steady-state policy or RIB fault), the DIRECT mesh is the preferred
   DCI transport (over **both** LDP and SR-ISIS), and all cross-DC L2/L3 flows (every ES +
   single-homed) are lossless.
-  - `test_control_plane_established` and `test_remote_dest_via_local_dcgw` use **`fcli`**
+  - `test_control_plane_established`, `test_control_plane_wan_vpnv4_remote_prefix_on_dcgws`
+    (when `fcli bgp-rib -r l3vpn-v4` is available), and `test_remote_dest_via_local_dcgw` use **`fcli`**
     (fabric CLI) for fabric-wide BGP/RIB state in a single gNMI query — `fcli -o json
-    bgp-peers` for session state and `fcli -o json bgp-rib -r evpn` for next-hops —
-    instead of per-node CLI scraping. `fcli` is an external tool (not a pip dependency);
-    these two tests **skip gracefully** if it is not on `PATH`. All other tests use
-    `docker exec` (data-plane ping/iperf in client netns + per-port counters).
+    bgp-peers` for session state **and** per-AFI received/active/sent counters (group-aware),
+    `fcli -o json bgp-rib -r evpn` for next-hops, and
+    `fcli -o json bgp-rib -r l3vpn-v4` for the WAN VPNv4 RIB on DCGWs —
+    instead of per-node CLI scraping. The transport checks (`test_direct_path_preferred`,
+    `test_wan_transports_both_present`, `test_wan_transport_failover`) likewise read
+    `fcli -o json tunnel-table`, and the ECMP/​pinning tests read cumulative DCI-egress
+    counters via `fcli -o json ifstats`. `fcli` is a **required** external tool (not a pip
+    dependency, install via `uv` — see above); the suite **stops early with an install
+    hint** if it is not on `PATH`. Only the data-plane checks use `docker exec`
+    (ping/iperf in client netns) and config changes use `sr_cli` (fcli is read-only).
   - `test_remote_dest_via_local_dcgw`: on **every** leaf, asserts all EVPN next-hops stay
     in the *local* DC's VTEP subnet — intra-DC routes point at local leaves and remote-DC
     destinations are re-originated by the local DCGW pair (`.151/.152` in DC1, `.153/.154`
@@ -475,18 +604,18 @@ client against a remote server. `-t 0` runs until stopped:
 
 ```bash
 # L2 DCI: DC1 mh client -> DC2 mh client (continuous)
-docker exec -d clab-dci-nvd-without-eda-mh-dc1 \
+docker exec -d clab-dci-srl-mh-dc1 \
   ip netns exec mh1-l2a iperf3 -c 10.100.0.21 -t 0 -i 10
 
 # L3 DCI: DC1 mh client -> DC2 mh client (continuous, routed across DCI)
-docker exec -d clab-dci-nvd-without-eda-mh-dc1 \
+docker exec -d clab-dci-srl-mh-dc1 \
   ip netns exec mh1-l3a iperf3 -c 10.200.2.21 -t 0 -i 10
 ```
 
 A simple auto-restarting loop (keeps a stream alive across path failovers):
 
 ```bash
-docker exec -d clab-dci-nvd-without-eda-sh-dc1 sh -c \
+docker exec -d clab-dci-srl-sh-dc1 sh -c \
   'while true; do ip netns exec sh1-l3 iperf3 -c 10.200.2.23 -t 30 -i 10; sleep 2; done'
 ```
 
@@ -533,13 +662,12 @@ flows blip and recover.
 
 ---
 
-## Optional: streaming-telemetry stack (`dci-without-eda-with-tm.clab.yaml`)
+## Streaming telemetry stack (`dci-srl.clab.yaml`)
 
-A companion topology file, **`dci-without-eda-with-tm.clab.yaml`**, deploys the
-**exact same fabric** (identical nodes, links, `configs/<node>.cli` startup-configs
-and `base-configs/*.sh` client bootstraps — nothing on the fabric is changed) and
-**adds a metrics telemetry stack** modeled on the
-[srl-labs/srl-telemetry-lab](https://github.com/srl-labs/srl-telemetry-lab):
+**`dci-srl.clab.yaml`** deploys the fabric **and** a metrics telemetry stack modeled on the
+[srl-labs/srl-telemetry-lab](https://github.com/srl-labs/srl-telemetry-lab) (identical nodes,
+links, `configs/<node>.cli` startup-configs and `base-configs/*.sh` client bootstraps — the
+fabric nodes are unchanged; only the telemetry containers are added):
 
 | Role | Software | mgmt IP | Exposed on host |
 |------|----------|---------|-----------------|
@@ -549,10 +677,9 @@ and `base-configs/*.sh` client bootstraps — nothing on the fabric is changed) 
 
 The three stack nodes are plain Linux containers attached to the `eda_mgmt`
 management network only — they have **no fabric data-plane links** and do **not**
-match the `configs/__clabNodeName__.cli` startup-config glob, so the lab keeps the
-existing topology and configs fully intact. The lab `name` is unchanged
-(`dci-nvd-without-eda`), so all existing container names, `tests/` and
-`tools/connmon.py` keep working; just deploy **one** of the two files at a time.
+match the `configs/__clabNodeName__.cli` startup-config glob. The lab `name` is
+`dci-srl`, so container names (`clab-dci-srl-<node>`),
+`tests/` and `tools/connmon.py` all keep working.
 
 `gnmic` subscribes over gNMI (`:57400`, user `admin` / `NokiaSrl1!`) to **all 18 SR
 Linux nodes** (8 leaves, 4 spines, 4 DCGWs, 2 P routers) for interface stats &
@@ -581,7 +708,7 @@ docker run --rm -v "$PWD":/data --entrypoint clab2drawio ghcr.io/srl-labs/clab-i
   -i /data/dci-srl.clab.yaml -g --theme nokia
 # 2) render the .drawio to SVG
 docker run --rm -v "$PWD":/data rlespinasse/drawio-desktop-headless \
-  -x -f svg -o /data/dci-srl.svg /data/dci-srl.clab.drawio
+  -x -f svg -o /data/dci-srl.svg /data/configs/telemetry/grafana/flow_panels/dci-topology.drawio
 # 3) make the SVG flow-panel-compatible, then inline it into the panel's "svg" option
 python3 - <<'PY'
 import re, json
@@ -604,14 +731,13 @@ PY
 > swaps those colors for the light-grey palette the reference lab uses.
 
 ```bash
-# From repository root (same directory as dci-srl.clab.yaml)
-sudo containerlab deploy -t dci-without-eda-with-tm.clab.yaml
+sudo containerlab deploy -t dci-srl.clab.yaml
 # Grafana: http://localhost:3000 (anonymous admin)  ·  Prometheus: http://localhost:9090
 ```
 
 Generate some cross-DC load (see *Continuous traffic with iperf3* above or
 `tools/connmon.py`) and watch the DCGW/leaf interface rates move on the dashboard.
-Destroy with `sudo containerlab destroy -t dci-without-eda-with-tm.clab.yaml --cleanup`.
+Destroy with `sudo containerlab destroy -t dci-srl.clab.yaml --cleanup`.
 
 > The telemetry configs live under `configs/telemetry/` (`gnmic/`, `prometheus/`,
 > `grafana/`). Only the **metrics** stack is included; a Loki/Alloy **logging** stack

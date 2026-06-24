@@ -166,12 +166,14 @@ set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 1 admin-stat
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 1 vxlan-interface vxlan0.100
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 1 evi 100
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 1 ecmp 8
+set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 1 internal-tags set-tag-set [ tag-1 ]
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 1 multi-homing-mode access
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 1 routes bridge-table inclusive-mcast originating-ip 192.0.3.150
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 2 admin-state enable
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 2 encapsulation-type mpls
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 2 evi 1100
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 2 ecmp 8
+set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 2 internal-tags set-tag-set [ tag-2 ]
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 2 mpls next-hop-resolution allowed-tunnel-types [ ldp sr-isis ]
 set / network-instance macvrf-l2dci protocols bgp-evpn bgp-instance 2 routes bridge-table inclusive-mcast originating-ip 192.0.3.150
 set / network-instance macvrf-l2dci protocols bgp-vpn bgp-instance 1 route-distinguisher rd 192.0.3.150:100
@@ -191,12 +193,14 @@ set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 1 admin-st
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 1 vxlan-interface vxlan0.110
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 1 evi 110
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 1 ecmp 8
+set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 1 internal-tags set-tag-set [ tag-1 ]
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 1 multi-homing-mode access
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 1 routes bridge-table inclusive-mcast originating-ip 192.0.3.150
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 2 admin-state enable
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 2 encapsulation-type mpls
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 2 evi 1110
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 2 ecmp 8
+set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 2 internal-tags set-tag-set [ tag-2 ]
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 2 mpls next-hop-resolution allowed-tunnel-types [ ldp sr-isis ]
 set / network-instance macvrf-l2dci-b protocols bgp-evpn bgp-instance 2 routes bridge-table inclusive-mcast originating-ip 192.0.3.150
 set / network-instance macvrf-l2dci-b protocols bgp-vpn bgp-instance 1 route-distinguisher rd 192.0.3.150:110
@@ -216,6 +220,7 @@ set / network-instance ipvrf-l3dci protocols bgp-evpn bgp-instance 1 admin-state
 set / network-instance ipvrf-l3dci protocols bgp-evpn bgp-instance 1 vxlan-interface vxlan0.3000
 set / network-instance ipvrf-l3dci protocols bgp-evpn bgp-instance 1 evi 3000
 set / network-instance ipvrf-l3dci protocols bgp-evpn bgp-instance 1 ecmp 8
+set / network-instance ipvrf-l3dci protocols bgp-evpn bgp-instance 1 internal-tags set-tag-set [ tag-1 ]
 # D-PATH loop prevention (draft-ietf-bess-evpn-ipvpn-interworking): DC2 EVPN
 # domain = 65000:2, shared WAN IP-VPN domain = 65000:100. A route re-originated
 # into DC2 by this GW and re-injected toward the WAN by the peer DC2 GW carries
@@ -225,6 +230,7 @@ set / network-instance ipvrf-l3dci protocols bgp-ipvpn bgp-instance 2 admin-stat
 set / network-instance ipvrf-l3dci protocols bgp-ipvpn bgp-instance 2 dpath-domain-id 65000:100
 set / network-instance ipvrf-l3dci protocols bgp-ipvpn bgp-instance 2 encapsulation-type mpls
 set / network-instance ipvrf-l3dci protocols bgp-ipvpn bgp-instance 2 ecmp 8
+set / network-instance ipvrf-l3dci protocols bgp-ipvpn bgp-instance 2 internal-tags set-tag-set [ tag-2 ]
 set / network-instance ipvrf-l3dci protocols bgp-ipvpn bgp-instance 2 mpls next-hop-resolution allowed-tunnel-types [ ldp sr-isis ]
 set / network-instance ipvrf-l3dci protocols bgp-vpn bgp-instance 1 route-distinguisher rd 192.0.3.153:3000
 set / network-instance ipvrf-l3dci protocols bgp-vpn bgp-instance 1 route-target export-rt target:3000:3000
@@ -232,8 +238,8 @@ set / network-instance ipvrf-l3dci protocols bgp-vpn bgp-instance 1 route-target
 set / network-instance ipvrf-l3dci protocols bgp-vpn bgp-instance 2 route-distinguisher rd 192.0.3.153:13000
 set / network-instance ipvrf-l3dci protocols bgp-vpn bgp-instance 2 route-target export-rt target:65000:3000
 set / network-instance ipvrf-l3dci protocols bgp-vpn bgp-instance 2 route-target import-rt target:65000:3000
-set / routing-policy community-set vxlan member [ bgp-tunnel-encap:VXLAN ]
-set / routing-policy community-set mpls member [ bgp-tunnel-encap:MPLS ]
+set / routing-policy tag-set tag-1 tag-value [ 1 ]
+set / routing-policy tag-set tag-2 tag-value [ 2 ]
 set / routing-policy extended-community-set soo-dc2 member [ origin:65000:2 ]
 # per-service L2 gateway load-sharing: this gateway is PRIMARY for BD-A. It de-prefers
 # BD-B on BOTH DCI planes so BD-B rides the peer gateway (dcgw4 in DC2, dcgw2 in DC1)
@@ -261,7 +267,7 @@ set / routing-policy policy dcgw-dc-export-dc2 statement 5 match protocol local
 set / routing-policy policy dcgw-dc-export-dc2 statement 5 match prefix prefix-set prefixset-dc2
 set / routing-policy policy dcgw-dc-export-dc2 statement 5 action policy-result accept
 set / routing-policy policy dcgw-dc-export-dc2 statement 10 match family [ evpn ]
-set / routing-policy policy dcgw-dc-export-dc2 statement 10 match bgp community-set mpls
+set / routing-policy policy dcgw-dc-export-dc2 statement 10 match internal-tags tag-set [ tag-2 ]
 set / routing-policy policy dcgw-dc-export-dc2 statement 10 action policy-result reject
 set / routing-policy policy dcgw-dc-export-dc2 statement 12 match family [ evpn ]
 set / routing-policy policy dcgw-dc-export-dc2 statement 12 match bgp extended-community extended-community-set rt-l2dci-b
@@ -281,6 +287,7 @@ set / routing-policy policy dcgw-dc-import-dc2 statement 10 match bgp extended-c
 set / routing-policy policy dcgw-dc-import-dc2 statement 10 action policy-result reject
 set / routing-policy policy dcgw-dc-import-dc2 statement 20 match family [ evpn ]
 set / routing-policy policy dcgw-dc-import-dc2 statement 20 action policy-result accept
+set / routing-policy policy dcgw-dc-import-dc2 statement 20 action internal-tags set-tag-set [ tag-1 ]
 set / routing-policy policy dcgw-dc-import-dc2 statement 30 match family [ ipv4-unicast ]
 set / routing-policy policy dcgw-dc-import-dc2 statement 30 action policy-result accept
 set / routing-policy policy dcgw-dc-import-dc2 statement 40 match family [ ipv6-unicast ]
@@ -290,7 +297,7 @@ set / routing-policy policy dcgw-wan-export-dc2 statement 8 match family [ l3vpn
 set / routing-policy policy dcgw-wan-export-dc2 statement 8 match prefix prefix-set host-routes-l3dci
 set / routing-policy policy dcgw-wan-export-dc2 statement 8 action policy-result reject
 set / routing-policy policy dcgw-wan-export-dc2 statement 10 match family [ evpn ]
-set / routing-policy policy dcgw-wan-export-dc2 statement 10 match bgp community-set vxlan
+set / routing-policy policy dcgw-wan-export-dc2 statement 10 match internal-tags tag-set [ tag-1 ]
 set / routing-policy policy dcgw-wan-export-dc2 statement 10 action policy-result reject
 set / routing-policy policy dcgw-wan-export-dc2 statement 15 match family [ evpn ]
 set / routing-policy policy dcgw-wan-export-dc2 statement 15 match bgp extended-community extended-community-set rt-wan-l2dci-b
@@ -307,6 +314,7 @@ set / routing-policy policy dcgw-wan-import-dc2 statement 10 match bgp extended-
 set / routing-policy policy dcgw-wan-import-dc2 statement 10 action policy-result reject
 set / routing-policy policy dcgw-wan-import-dc2 statement 20 match family [ evpn ]
 set / routing-policy policy dcgw-wan-import-dc2 statement 20 action policy-result accept
+set / routing-policy policy dcgw-wan-import-dc2 statement 20 action internal-tags set-tag-set [ tag-2 ]
 set / routing-policy policy dcgw-wan-import-dc2 statement 30 match family [ l3vpn-ipv4-unicast ]
 set / routing-policy policy dcgw-wan-import-dc2 statement 30 action policy-result accept
 set / tunnel-interface vxlan0 vxlan-interface 100 type bridged

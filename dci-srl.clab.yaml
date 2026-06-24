@@ -20,7 +20,7 @@
 # named "license-srlinux.txt" in this directory before deploying. The 7220
 # ixr-d2l/ixr-d3l leaves and spines need no license.
 
-name: dci-nvd-without-eda
+name: dci-srl
 prefix: ""
 
 mgmt:
