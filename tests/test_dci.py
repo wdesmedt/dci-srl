@@ -8,6 +8,14 @@ Run from this directory (lab must be deployed):
 
     python3 -m venv .venv && . .venv/bin/activate
     pip install -r requirements.txt
+
+    # fcli is a REQUIRED prerequisite (fabric-wide reporting over gNMI); it is
+    # not a pip dependency - install it once as a standalone tool with uv
+    # (>= 0.4.3, the first release with the tunnel-table report):
+    #     uv tool install --force git+https://github.com/srl-labs/nornir-srl
+    # (ensure the uv tools bin dir, e.g. ~/.local/bin, is on PATH). The suite
+    # stops early with an install hint if fcli is missing or older than 0.4.3.
+
     pytest -v                         # everything
     pytest -v -m connectivity         # just the steady-state checks
     pytest -v -m "not disruptive"     # skip anything that injects a fault
@@ -17,7 +25,9 @@ Disruptive tests always restore the topology in fixture teardown.
 """
 from __future__ import annotations
 
+import re
 import time
+from collections import defaultdict
 
 import pytest
 
@@ -32,25 +42,122 @@ from conftest import (
     LOCAL_DCGW_VTEPS,
     DIRECT_MESH_PORTS,
     DCGW_ALL_PORTS,
+    DCGW_DCI_PORTS,
     DIAGONAL_DCGW_PAIRS,
     ENDPOINTS,
     ALL_DCGWS,
     WAN_TRANSPORTS,
+    _fcli_node_matches,
     dci_tunnels,
     dcgw_dci_out_packets,
     disable_wan_transport,
+    fcli_bgp_rib_l3vpn_v4_available,
     l3dci_ipv4_rib,
+    l3vpn_ipv4_rib_wan,
     measure_convergence,
     ping,
+    remote_dcgw_loopback_ips,
     remote_dcgw_loopbacks,
+    remote_l3dci_subnet,
     run_flows,
     set_ports,
-    srl,
     wait_until_healthy,
 )
 
 # outage budget (seconds) - generous; the test also prints the measured value
 WAN_FAILOVER_BUDGET = 20.0
+
+
+def _rib_pfx(r: dict) -> str | None:
+    """BGP RIB prefix field (L3VPN uses ``Pfx``; EVPN / IP RIB may use ``Prefix``)."""
+    return r.get("Pfx") or r.get("Prefix")
+
+
+def _rib_nexthops(r: dict) -> set[str]:
+    nh = r.get("next-hop")
+    if nh is None:
+        return set()
+    if isinstance(nh, list):
+        return {str(x) for x in nh}
+    return {str(nh)}
+
+
+# fcli ``bgp-peers`` ``-o json`` keys: current nornir-srl uses wrapped table headers
+# flattened to a single space, e.g. ``EVPN R/A/T``, ``U4 R/A/T``, ``VPNv6 R/A/T``,
+# ``VPNv4 R/A/T``. Older builds used ``AF: … Rx/Act/Tx`` — keep both as aliases.
+_BGP_RAT_ALIASES: dict[str, tuple[str, ...]] = {
+    "evpn": (
+        "EVPN R/A/T",
+        "EV R/A/T",
+        "AF: EVPN Rx/Act/Tx",
+    ),
+    "vpnv4": (
+        "VPNv4 R/A/T",
+        "V4 R/A/T",
+        "AF: L3VPN IPv4 Rx/Act/Tx",
+        "AF: VPNv4 Rx/Act/Tx",
+    ),
+    "u4": (
+        "U4 R/A/T",
+        "AF: IPv4 Rx/Act/Tx",
+    ),
+}
+
+
+def _required_rat_kinds(group: str, peers: list[dict]) -> tuple[str, ...]:
+    """AFI kinds to validate for ``group`` on one DCGW (``peers`` = rows for that group)."""
+    if group == "dc-fabric":
+        return ("evpn", "u4")
+    # wan-ibgp: require VPNv4/L3VPN counters only when fcli exposes that column
+    # (legacy ``bgp-peers`` JSON had EVPN on wan-ibgp but no separate VPNv4 field).
+    kinds: list[str] = ["evpn"]
+    if any(any(k in p for k in _BGP_RAT_ALIASES["vpnv4"]) for p in peers):
+        kinds.append("vpnv4")
+    return tuple(kinds)
+
+
+def _bgp_rat_cell(row: dict, kind: str) -> str | None:
+    for key in _BGP_RAT_ALIASES[kind]:
+        v = row.get(key)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return None
+
+
+_RAT_RE = re.compile(r"^(\d+)/(\d+)/(\d+)\s*$")
+
+
+def _parse_bgp_rat(val: str | None) -> tuple[int, int, int] | None:
+    """Parse ``recv/active/sent`` counts from an ``fcli bgp-peers`` R/A/T cell."""
+    if val is None:
+        return None
+    s = val.strip()
+    if s in ("-", "disabled") or s.lower().startswith("down"):
+        return None
+    m = _RAT_RE.match(s)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _dcgw_bgp_rows(rows: list[dict]) -> list[dict]:
+    """BGP peer rows for DCGWs in ``wan-ibgp`` or ``dc-fabric`` (hostname-safe)."""
+    out: list[dict] = []
+    for r in rows:
+        node = r.get("Node")
+        if not any(_fcli_node_matches(node, d) for d in ALL_DCGWS):
+            continue
+        if r.get("group") not in ("wan-ibgp", "dc-fabric"):
+            continue
+        out.append(r)
+    return out
+
+
+def _node_label(node_val: str | None) -> str:
+    for d in ALL_DCGWS:
+        if _fcli_node_matches(node_val, d):
+            return d
+    return str(node_val or "?")
 
 
 # --------------------------------------------------------------------------- #
@@ -59,23 +166,112 @@ WAN_FAILOVER_BUDGET = 20.0
 
 @pytest.mark.connectivity
 def test_control_plane_established(bgp_peers_fabric):
-    """Every DCGW BGP session (iBGP WAN mesh + eBGP fabric) is established.
+    """DCGW BGP sessions (iBGP WAN mesh + eBGP fabric) are established *and* exchanging
+    routes on the AFIs each group actually runs.
 
-    Uses a single fabric-wide `fcli bgp-peers` query instead of per-node CLI
-    scraping, so one assertion covers all four gateways at once.
+    Uses one fabric-wide ``fcli bgp-peers`` snapshot. Session state must be
+    ``established``. For each DCGW + peer-group, every *required* R/A/T column must
+    not be dead on **all** peers at once: in steady state at least one neighbor must
+    have non-zero received, non-zero active, and non-zero sent (policy or dataplane
+    issues often collapse to all-zero across the whole group).
+
+    JSON keys follow the current ``bgp-peers`` column titles (e.g. ``EVPN R/A/T``,
+    ``VPNv4 R/A/T``); legacy ``AF: … Rx/Act/Tx`` keys are still accepted. WAN VPNv4
+    counters are required only when a dedicated L3VPN column exists (some older
+    reports exposed EVPN on ``wan-ibgp`` but not VPNv4).
     """
-    rows = [r for r in bgp_peers_fabric
-            if r.get("Node") in ALL_DCGWS
-            and r.get("group") in ("wan-ibgp", "dc-fabric")]
+    rows = _dcgw_bgp_rows(bgp_peers_fabric)
     assert rows, "fcli bgp-peers returned no DCGW wan-ibgp/dc-fabric sessions"
-    bad = [f"{r.get('Node')} {r.get('1_peer')} [{r.get('group')}]: {r.get('state')}"
-           for r in rows if r.get("state") != "established"]
-    assert not bad, "non-established DCGW session(s):\n" + "\n".join(bad)
+
+    bad_state = [
+        f"{_node_label(r.get('Node'))} {r.get('peer')} [{r.get('group')}]: {r.get('state')}"
+        for r in rows
+        if r.get("state") != "established"
+    ]
+    assert not bad_state, "non-established DCGW session(s):\n" + "\n".join(bad_state)
+
+    by: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in rows:
+        by[(_node_label(r.get("Node")), str(r.get("group")))].append(r)
+
+    failures: list[str] = []
+    for (dcgw, group), peers in sorted(by.items()):
+        for kind in _required_rat_kinds(group, peers):
+            rx_any = act_any = sent_any = False
+            parsed_any = False
+            for p in peers:
+                cell = _bgp_rat_cell(p, kind)
+                t = _parse_bgp_rat(cell)
+                if t is None:
+                    continue
+                parsed_any = True
+                rx, act, sent = t
+                if rx > 0:
+                    rx_any = True
+                if act > 0:
+                    act_any = True
+                if sent > 0:
+                    sent_any = True
+            label = "/".join(_BGP_RAT_ALIASES[kind])
+            if not parsed_any:
+                failures.append(
+                    f"{dcgw} group={group} {label}: no parseable R/A/T cells among "
+                    f"{len(peers)} peer(s) (missing column or all disabled/down/-)"
+                )
+                continue
+            if not rx_any:
+                failures.append(
+                    f"{dcgw} group={group} {label}: every peer has received=0 "
+                    f"({len(peers)} session(s))"
+                )
+            if not act_any:
+                failures.append(
+                    f"{dcgw} group={group} {label}: every peer has active=0 — "
+                    "steady-state policy or RIB selection fault"
+                )
+            if not sent_any:
+                failures.append(
+                    f"{dcgw} group={group} {label}: every peer has sent=0 "
+                    f"({len(peers)} session(s))"
+                )
+
+    assert not failures, "BGP route counters failed:\n" + "\n".join(failures)
 
 
-# --------------------------------------------------------------------------- #
-# 1. steady-state connectivity (L2 + L3, multi-homed + single-homed)
-# --------------------------------------------------------------------------- #
+@pytest.mark.connectivity
+def test_control_plane_wan_vpnv4_remote_prefix_on_dcgws():
+    """Each DCGW learns the remote DC's L3 DCI /24 in the WAN VPNv4 RIB (``default`` NI).
+
+    This complements ``ipv4-rib`` on ``ipvrf-l3dci`` (stitched IFL view): the IP-VPN
+    control plane must carry the other site's tenant prefix toward the remote DCGW
+    loopbacks. Requires ``fcli bgp-rib -r l3vpn-v4`` (nornir-srl with L3VPN RIB); older
+    fcli builds skip this test.
+    """
+    if not fcli_bgp_rib_l3vpn_v4_available():
+        pytest.skip(
+            "fcli does not support `bgp-rib -r l3vpn-v4`; install a current nornir-srl "
+            "(see README fcli section)"
+        )
+    rib = l3vpn_ipv4_rib_wan()
+    for dcgw in ALL_DCGWS:
+        dc = 1 if dcgw in DC1_DCGWS else 2
+        want = remote_l3dci_subnet(dc)
+        expect_nh = remote_dcgw_loopback_ips(dc)
+        rows = [r for r in rib if _fcli_node_matches(r.get("Node"), dcgw)]
+        matches = [r for r in rows if _rib_pfx(r) == want]
+        assert matches, f"{dcgw}: no VPNv4 row for remote subnet {want} in default NI"
+        best = [r for r in matches if ">" in str(r.get("st", ""))]
+        assert best, f"{dcgw}: no best VPNv4 path for {want} among {matches}"
+        nh_seen = set().union(*(_rib_nexthops(r) for r in best))
+        assert nh_seen & expect_nh, (
+            f"{dcgw}: best-path next-hop(s) for {want} do not include a remote DCGW "
+            f"loopback from {sorted(expect_nh)} (saw {sorted(nh_seen)})"
+        )
+        stray = nh_seen - expect_nh
+        assert not stray, (
+            f"{dcgw}: unexpected VPNv4 next-hop(s) for {want}: {sorted(stray)} "
+            f"(expected only remote DCGW loopbacks {sorted(expect_nh)})"
+        )
 
 # cross-DC flows: (source endpoint key, destination endpoint key)
 L2_FLOWS = [
@@ -263,6 +459,20 @@ def test_l3_host_route_scoped_to_local_dc(host, pinger, multihomed):
     assert not no_subnet, \
         f"remote-DC node(s) missing the covering {subnet24}: {no_subnet}"
 
+    # 3b) defense-in-depth: host /32 must not appear in the WAN VPNv4 RIB on the
+    #     remote DC's DCGWs (export policy drops host routes from l3vpn families).
+    if fcli_bgp_rib_l3vpn_v4_available():
+        vpn = l3vpn_ipv4_rib_wan()
+        for gw in DC_DCGWS[remote]:
+            leaked_vpn = [
+                r for r in vpn
+                if _fcli_node_matches(r.get("Node"), gw) and _rib_pfx(r) == host32
+            ]
+            assert not leaked_vpn, (
+                f"{host32} appeared in WAN VPNv4 RIB on remote DCGW {gw}; "
+                "host routes must not be advertised across the IP-VPN core"
+            )
+
     # 4) multi-homing load-balancing: a multi-homed host /32 must alias across ALL
     #    its ES leaf VTEPs (advertise-ifl-host-ad-routes), so every other in-DC
     #    node resolves it via >=2 next-hops - otherwise inter-subnet traffic to the
@@ -288,14 +498,15 @@ def test_direct_path_preferred():
     # must egress a direct-mesh port (ethernet-1/3..5), not a P-facing WAN uplink.
     tunnels = dci_tunnels("dcgw1")
     row = tunnels.get("192.0.3.153/32", {})
-    assert row, f"no tunnels to dcgw3 loopback:\n{srl('dcgw1', 'show network-instance default tunnel-table all')}"
+    assert row, f"no tunnels to dcgw3 loopback (dcgw1 tunnel-table: {tunnels})"
     mesh = [f"{p}." for p in DIRECT_MESH_PORTS["dcgw1"]]  # e.g. 'ethernet-1/3.'
     for transport in WAN_TRANSPORTS:
-        port = row.get(transport)
-        assert port, f"no {transport} tunnel to dcgw3 loopback (saw {row})"
-        assert any(port.startswith(p) for p in mesh), (
-            f"{transport} tunnel to dcgw3 not on a direct-mesh port "
-            f"(expected one of {mesh}): {port}"
+        ports = row.get(transport)
+        assert ports, f"no {transport} tunnel to dcgw3 loopback (saw {row})"
+        off_mesh = [p for p in ports if not any(p.startswith(m) for m in mesh)]
+        assert not off_mesh, (
+            f"{transport} tunnel to dcgw3 egresses non-direct-mesh port(s) {off_mesh} "
+            f"(expected all on {mesh}): {ports}"
         )
 
 
@@ -596,3 +807,45 @@ def test_diagonal_dcgw_double_failure(victims, restore_dcgw, record_property):
     bad = [f"{s}->{d}={r}%" for (s, d) in post
            for r in [ping(ENDPOINTS[s], ENDPOINTS[d].ip, count=4).loss_pct] if r != 0.0]
     assert not bad, "flows not fully restored after GW recovery: " + ", ".join(bad)
+
+
+# --------------------------------------------------------------------------- #
+# 8. WAN link failure: isolate WAN ports of a single DCGW
+# --------------------------------------------------------------------------- #
+#
+# Simulates a linecard failure containing all WAN links (uplinks + direct mesh)
+# on a per-DCGW basis. Fabric-facing ports are left up, so the local fabric
+# nodes must withdraw routes once BGP session/resolution fails, redirecting
+# traffic to the peer gateway.
+
+@pytest.mark.disruptive
+@pytest.mark.convergence
+@pytest.mark.parametrize("victim", ALL_DCGWS)
+@pytest.mark.parametrize("flows", [L2_MULTIFLOW, L3_MULTIFLOW], ids=["l2", "l3"])
+def test_wan_links_failure(victim, flows, restore_dcgw, record_property):
+    """
+    Run many hashed flows, disable all WAN links (ethernet-1/3..7) on one DCGW
+    mid-stream, and confirm every flow survives via the remaining gateways
+    with low loss. This mimics a linecard failure containing all WAN links.
+    """
+    duration = 30.0
+
+    def _isolate():
+        restore_dcgw.append(victim)
+        set_ports(victim, DCGW_DCI_PORTS, "disable")
+
+    results = run_flows(flows, bitrate=FLOW_BITRATE, duration=duration,
+                        streams=FLOW_STREAMS, action=_isolate, action_delay=6.0)
+    losses = [r.loss_pct for r in results]
+    worst, avg = max(losses), sum(losses) / len(losses)
+    for r in results:
+        print(f"\n  {r.name}: loss={r.loss_pct:.2f}% ({r.lost}/{r.sent})")
+    record_property("worst_loss_pct", worst)
+    record_property("avg_loss_pct", avg)
+    print(f"\n[WAN links failure, isolate WAN ports of {victim}] worst-flow loss={worst:.2f}% "
+          f"avg={avg:.2f}% over {len(results)} hashed flows")
+    assert all(r.sent > 0 for r in results), "a flow sent no traffic"
+    # Allow slightly higher loss budget due to protocol-driven failover
+    assert worst < 30.0, f"a flow lost too much during WAN links failure: {worst:.2f}%"
+    assert avg < 15.0, f"average loss across flows too high: {avg:.2f}%"
+

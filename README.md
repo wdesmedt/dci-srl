@@ -32,7 +32,7 @@ configuration is the same for both.
 - **WAN core**: 2 P/PE routers (7250 IXR-X3b)
 - **Clients**: 6 `network-multitool` containers (2 multi-homed + 1 single-homed per DC)
 
-![DCI topology: two EVPN-VXLAN datacenters (DC1 192.0.2.0/24, DC2 192.0.3.0/24), each with 4 leaves / 2 spines / 2 DCGWs, interconnected by a DCGW direct full-mesh and a 2-router MPLS WAN core](dci-srl.svg)
+![DCI topology: two EVPN-VXLAN datacenters (DC1 192.0.2.0/24, DC2 192.0.3.0/24), each with 4 leaves / 2 spines / 2 DCGWs, interconnected by a DCGW direct full-mesh and a 2-router MPLS WAN core](dci-srl.clab.svg)
 
 Client attachment (each DC has **two** independent all-active Ethernet-Segments plus a
 single-homed client, giving enough flows to hash DCI traffic across both gateways):
@@ -261,7 +261,7 @@ sudo containerlab destroy -t dci-srl.clab.yaml --cleanup
 ```
 
 Give the fabric ~2–3 minutes to converge (eBGP, IS-IS/LDP, iBGP, EVPN, then client
-bootstrap). Inspect a node with `ssh admin@clab-dci-srl-leaf1` (password
+bootstrap). Inspect a node with `ssh admin@leaf1` (password
 `NokiaSrl1!`).
 
 ---
@@ -278,8 +278,6 @@ nodes** (8 leaves, 4 spines, 4 DCGWs, 2 P routers) and returns one consolidated 
 you see the whole fabric at a glance instead of scraping `show ...` on 18 boxes.
 
 ```bash
-# from the repo root (where dci-srl.clab.yaml lives)
-
 # Scope to a subset with the inventory filter (-i) using the topology labels:
 #   role = leaf | spine | dcgw | pe        site = dc1 | dc2 | wan
 fcli -t dci-srl.clab.yaml bgp-peers                 # all nodes
@@ -301,7 +299,7 @@ fcli -t dci-srl.clab.yaml -o json vxlan | jq .      # machine-readable
 
 **When per-node `show` is better — and why the steps below still use it.** `fcli`
 reports SR Linux *state* models, but a few DCI-specific checks need detail it does not
-surface, so for those reach into a single node with `ssh admin@clab-dci-srl-<node>`
+surface, so for those reach into a single node with `ssh admin@<node>`
 (or `docker exec -i <node> sr_cli`):
 
 - **MPLS transport / tunnel-table** — `fcli tunnel-table` now gives the fabric-wide view of
@@ -332,8 +330,8 @@ Stretched bridge-domain — a single subnet 10.100.0.0/24 across both DCs.
 
 ```bash
 # DC1 logical client -> DC2 logical client (same subnet, pure L2)
-docker exec clab-dci-srl-mh-dc1 ip netns exec mh1-l2a ping 10.100.0.21
-docker exec clab-dci-srl-sh-dc1 ip netns exec sh1-l2  ping 10.100.0.23
+docker exec mh-dc1 ip netns exec mh1-l2a ping 10.100.0.21
+docker exec sh-dc1 ip netns exec sh1-l2  ping 10.100.0.23
 ```
 On a DCGW: `show network-instance macvrf-l2dci bridge-table mac-table all` shows remote
 MACs reachable via the EVPN-MPLS (instance 2) next-hop, resolved over the **direct**
@@ -344,8 +342,8 @@ mesh (low IS-IS metric).
 Different subnet per DC, routed across the DCI via `ipvrf-l3dci`.
 
 ```bash
-docker exec clab-dci-srl-mh-dc1 ip netns exec mh1-l3a ping 10.200.2.21
-docker exec clab-dci-srl-sh-dc1 ip netns exec sh1-l3  ping 10.200.2.23
+docker exec mh-dc1 ip netns exec mh1-l3a ping 10.200.2.21
+docker exec sh-dc1 ip netns exec sh1-l3  ping 10.200.2.23
 ```
 On a DCGW: `show network-instance ipvrf-l3dci route-table ipv4-unicast` shows the remote
 DC subnet learned via IP-VPN; `show network-instance default protocols bgp routes
@@ -415,8 +413,9 @@ The manual checks above are also implemented as an ad-hoc [pytest](tests/) suite
 drives the running lab over `docker exec`. It covers steady-state L2/L3 connectivity
 (multi-homed + single-homed), **ECMP load-sharing across both DCGWs**, the parallel
 **LDP / SR-ISIS WAN transports**, the DIRECT→WAN failover, **DCGW redundancy under
-multiple hashed iperf3 flows**, and a **diagonal double-gateway failure** (one DCGW per
-DC). Every test that injects a fault restores the topology in teardown.
+multiple hashed iperf3 flows**, a **diagonal double-gateway failure** (one DCGW per
+DC), and a **WAN links failure** (all WAN/DCI-facing links on one gateway fail). Every
+test that injects a fault restores the topology in teardown.
 
 The suite uses **`fcli`** for fabric-wide gNMI reports (`bgp-peers`, BGP RIBs including
 EVPN and—when supported—**L3VPN IPv4** in the WAN `default` instance, `ipv4-rib` in
@@ -576,6 +575,11 @@ What the markers map to:
     DCs at once. BD-A, BD-B and L3 flows must all survive via the surviving gateway in
     each DC, and the test then re-enables the gateways and **re-pings every flow to
     confirm connectivity is fully restored**.
+  - `test_wan_links_failure[dcgw1|dcgw2|dcgw3|dcgw4]`: isolate all **WAN/DCI-facing ports**
+    (`ethernet-1/3..7`) on a single DCGW mid-stream, leaving its local DC fabric-facing ports
+    active. This mimics a linecard failure containing all WAN links. The test is run for
+    every gateway in sequence. Traffic must recover via the surviving gateway, requiring
+    BGP/routing protocols to propagate the path failure and withdraw routes.
 
 > **Bandwidth note:** these are software-forwarding containers, so the flow generators
 > use a deliberately modest rate (`-b 1M` × 4 streams per flow). Pushing higher rates
@@ -593,6 +597,9 @@ per-flow UDP loss while one gateway is fully isolated):
 - Diagonal double failure (`dcgw1+dcgw4` / `dcgw2+dcgw3`): only the BD whose primary GW
   was killed takes a brief hit (worst-flow ≈ 4 %, avg ≈ 1–1.6 %); all flows lossless
   again after the gateways are restored
+- WAN links failure (isolate WAN ports on one gateway): traffic recovers via the peer
+  gateway in the local DC after BGP/routing protocol withdraws propagate (worst-flow
+  loss budget < 30 %, avg < 15 %)
 
 ---
 
@@ -604,18 +611,18 @@ client against a remote server. `-t 0` runs until stopped:
 
 ```bash
 # L2 DCI: DC1 mh client -> DC2 mh client (continuous)
-docker exec -d clab-dci-srl-mh-dc1 \
+docker exec -d mh-dc1 \
   ip netns exec mh1-l2a iperf3 -c 10.100.0.21 -t 0 -i 10
 
 # L3 DCI: DC1 mh client -> DC2 mh client (continuous, routed across DCI)
-docker exec -d clab-dci-srl-mh-dc1 \
+docker exec -d mh-dc1 \
   ip netns exec mh1-l3a iperf3 -c 10.200.2.21 -t 0 -i 10
 ```
 
 A simple auto-restarting loop (keeps a stream alive across path failovers):
 
 ```bash
-docker exec -d clab-dci-srl-sh-dc1 sh -c \
+docker exec -d sh-dc1 sh -c \
   'while true; do ip netns exec sh1-l3 iperf3 -c 10.200.2.23 -t 30 -i 10; sleep 2; done'
 ```
 
@@ -662,12 +669,13 @@ flows blip and recover.
 
 ---
 
-## Streaming telemetry stack (`dci-srl.clab.yaml`)
+## Optional: streaming-telemetry stack (`dci-srl-with-tm.clab.yaml`)
 
-**`dci-srl.clab.yaml`** deploys the fabric **and** a metrics telemetry stack modeled on the
-[srl-labs/srl-telemetry-lab](https://github.com/srl-labs/srl-telemetry-lab) (identical nodes,
-links, `configs/<node>.cli` startup-configs and `base-configs/*.sh` client bootstraps — the
-fabric nodes are unchanged; only the telemetry containers are added):
+A companion topology file, **`dci-srl-with-tm.clab.yaml`**, deploys the
+**exact same fabric** (identical nodes, links, `configs/<node>.cli` startup-configs
+and `base-configs/*.sh` client bootstraps — nothing on the fabric is changed) and
+**adds a metrics telemetry stack** modeled on the
+[srl-labs/srl-telemetry-lab](https://github.com/srl-labs/srl-telemetry-lab):
 
 | Role | Software | mgmt IP | Exposed on host |
 |------|----------|---------|-----------------|
@@ -677,9 +685,10 @@ fabric nodes are unchanged; only the telemetry containers are added):
 
 The three stack nodes are plain Linux containers attached to the `eda_mgmt`
 management network only — they have **no fabric data-plane links** and do **not**
-match the `configs/__clabNodeName__.cli` startup-config glob. The lab `name` is
-`dci-srl`, so container names (`clab-dci-srl-<node>`),
-`tests/` and `tools/connmon.py` all keep working.
+match the `configs/__clabNodeName__.cli` startup-config glob, so the lab keeps the
+existing topology and configs fully intact. The lab `name` is unchanged
+(`dci-srl`), so all existing container names, `tests/` and
+`tools/connmon.py` keep working; just deploy **one** of the two files at a time.
 
 `gnmic` subscribes over gNMI (`:57400`, user `admin` / `NokiaSrl1!`) to **all 18 SR
 Linux nodes** (8 leaves, 4 spines, 4 DCGWs, 2 P routers) for interface stats &
@@ -708,11 +717,11 @@ docker run --rm -v "$PWD":/data --entrypoint clab2drawio ghcr.io/srl-labs/clab-i
   -i /data/dci-srl.clab.yaml -g --theme nokia
 # 2) render the .drawio to SVG
 docker run --rm -v "$PWD":/data rlespinasse/drawio-desktop-headless \
-  -x -f svg -o /data/dci-srl.svg /data/configs/telemetry/grafana/flow_panels/dci-topology.drawio
+  -x -f svg -o /data/dci-srl.clab.svg /data/dci-srl.clab.drawio
 # 3) make the SVG flow-panel-compatible, then inline it into the panel's "svg" option
 python3 - <<'PY'
 import re, json
-svg = open("dci-srl.svg").read()
+svg = open("dci-srl.clab.svg").read()
 svg = svg.replace(' data-cell-id="', ' id="cell-')   # plugin matches id="cell-<name>"
 svg = re.sub(r'\s+style="[^"]*"', '', svg)            # drop color-scheme/light-dark() (renders black on dark theme)
 svg = svg.replace('stroke="#000000"', 'stroke="#98a2ae"').replace('fill="#000000"', 'fill="#c7d0d9"').replace('fill="#ffffff"', 'fill="none"')
@@ -731,13 +740,14 @@ PY
 > swaps those colors for the light-grey palette the reference lab uses.
 
 ```bash
-sudo containerlab deploy -t dci-srl.clab.yaml
+cd validated-designs/dci/dci-srl
+sudo containerlab deploy -t dci-srl-with-tm.clab.yaml
 # Grafana: http://localhost:3000 (anonymous admin)  ·  Prometheus: http://localhost:9090
 ```
 
 Generate some cross-DC load (see *Continuous traffic with iperf3* above or
 `tools/connmon.py`) and watch the DCGW/leaf interface rates move on the dashboard.
-Destroy with `sudo containerlab destroy -t dci-srl.clab.yaml --cleanup`.
+Destroy with `sudo containerlab destroy -t dci-srl-with-tm.clab.yaml --cleanup`.
 
 > The telemetry configs live under `configs/telemetry/` (`gnmic/`, `prometheus/`,
 > `grafana/`). Only the **metrics** stack is included; a Loki/Alloy **logging** stack

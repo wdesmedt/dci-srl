@@ -2,16 +2,19 @@
 # Licensed under the BSD 3-Clause License
 # SPDX-License-Identifier: BSD-3-Clause
 
-# DCI validated design - without EDA (startup-config driven)
+# DCI validated design - without EDA - WITH a streaming-telemetry stack
 #
-# 2 datacenters (each: 2 spines = 7220 IXR-D3L, 4 leaves = 7220 IXR-D2L,
-# 2 DCGWs = 7250 IXR-X3b) interconnected by:
-#   - a DIRECT full-mesh between all 4 DCGWs, and
-#   - a WAN core of 2 P/PE routers (7250 IXR-X3b).
-# DCGWs stitch EVPN-VXLAN (DC) to EVPN-MPLS / IP-VPN (DCI) using a single
-# 2-instance-BGP construct per mac-vrf / ip-vrf. The MPLS DCI plane (IS-IS +
-# LDP) runs over BOTH the direct mesh (preferred, low metric) and the P core
-# (backup), so the same services validate over a direct and a WAN path.
+# This file is the SAME topology, node set, startup-configs and links as
+# dci-srl.clab.yaml (kept 100% intact - it reuses the exact same
+# configs/<node>.cli startup-configs and base-configs/*.sh client bootstraps).
+# It only ADDS a metrics telemetry stack (gnmic -> prometheus -> grafana),
+# modeled on https://github.com/srl-labs/srl-telemetry-lab, so the running DCI
+# fabric can be observed without touching any fabric node configuration.
+#
+# The telemetry nodes are plain Linux containers attached to the management
+# network only (no fabric data-plane links), and they do NOT match the
+# `configs/__clabNodeName__.cli` startup-config glob (that only resolves for the
+# SR Linux node names), so no fabric config is altered.
 #
 # NOTE: the 6 x ixr-x3b (7250) nodes REQUIRE a license. Place the license file
 # named "license-srlinux.txt" in this directory before deploying. The 7220
@@ -97,6 +100,52 @@ topology:
       labels: { role: client, site: dc2 }
       exec:
         - bash base-configs/mh-dc2b.sh
+
+    # ===================== TELEMETRY STACK ============================
+    # gnmic -> prometheus -> grafana. Management-network only; no fabric links,
+    # no fabric-config changes. group "10" tags the telemetry-stack nodes.
+    gnmic:
+      kind: linux
+      mgmt-ipv4: 172.21.21.41
+      image: ghcr.io/openconfig/gnmic:0.45.0
+      binds:
+        - configs/telemetry/gnmic/gnmic-config.yml:/gnmic-config.yml:ro
+      cmd: --config /gnmic-config.yml --log subscribe
+      labels: { role: telemetry, site: oob }
+      group: "10"
+
+    prometheus:
+      kind: linux
+      mgmt-ipv4: 172.21.21.42
+      image: quay.io/prometheus/prometheus:v3.11.3
+      binds:
+        - configs/telemetry/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      cmd: --config.file=/etc/prometheus/prometheus.yml
+      ports:
+        - 9090:9090
+      labels: { role: telemetry, site: oob }
+      group: "10"
+
+    grafana:
+      kind: linux
+      mgmt-ipv4: 172.21.21.43
+      image: grafana/grafana:13.0.1
+      binds:
+        - configs/telemetry/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yaml:ro
+        - configs/telemetry/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+        - configs/telemetry/grafana/dashboards:/var/lib/grafana/dashboards
+      ports:
+        - 3000:3000
+      env:
+        # andrewbmchugh-flow-panel renders the live "weathermap" topology panel
+        GF_INSTALL_PLUGINS: andrewbmchugh-flow-panel
+        GF_ORG_ROLE: Admin
+        GF_ORG_NAME: Main Org
+        GF_AUTH_ANONYMOUS_ENABLED: "true"
+        GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+        GF_AUTH_ANONYMOUS: "true"
+      labels: { role: telemetry, site: oob }
+      group: "10"
 
   links:
     # ===== DC1 leaf <-> spine =====

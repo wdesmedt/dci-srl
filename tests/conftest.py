@@ -5,7 +5,7 @@
 Shared fixtures / helpers for the DCI validated-design test suite.
 
 The tests drive the *running* containerlab topology over `docker exec`, so the
-lab must already be deployed (`containerlab deploy -t dci-without-eda.clab.yaml`)
+lab must already be deployed (`containerlab deploy -t dci-srl.clab.yaml`)
 on the same host where pytest runs.
 
 Nothing here is SR-Linux-release specific beyond the `sr_cli` CLI and the
@@ -13,6 +13,7 @@ client bootstrap (netns + 802.1q + LACP bonds) created by base-configs/*.sh.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -42,6 +43,12 @@ ALL_DCGWS = DC1_DCGWS + DC2_DCGWS
 
 # the L3-DCI tenant IP-VRF (one shared name on every leaf + DCGW)
 L3DCI_NI = "ipvrf-l3dci"
+# L3 DCI routed tenant subnets (cross-DC); see README addressing table
+L3DCI_SUBNET_DC1 = "10.200.1.0/24"
+L3DCI_SUBNET_DC2 = "10.200.2.0/24"
+# VPNv4 (l3vpn-ipv4-unicast) BGP RIB on DCGWs lives under ``default`` (WAN iBGP);
+# the eBGP fabric group keeps l3vpn-ipv4-unicast admin-state disable.
+WAN_VPNV4_NI = "default"
 
 # leaf VTEPs per DC + the underlay subnet each DC's VTEPs live in. Used to assert
 # that remote-DC destinations are only ever reached via the LOCAL DCGW pair
@@ -224,26 +231,30 @@ def set_ports(node: str, ports: list[str], state: str):
 # WAN MPLS transport (LDP / SR-ISIS) helpers
 # --------------------------------------------------------------------------- #
 
-def dci_tunnels(node: str) -> dict[str, dict[str, str]]:
-    """Parse the default IPv4 tunnel-table on `node`.
-
-    Returns {loopback-prefix: {transport: egress-port}} for the ldp/sr-isis
-    tunnels (the bordered CLI table is split on the column separator).
-    """
-    res: dict[str, dict[str, str]] = {}
-    out = srl(node, "show network-instance default tunnel-table all")
-    for line in out.splitlines():
-        if "|" not in line:
+def _tunnels_from_rows(rows: list[dict], node: str) -> dict[str, dict[str, list[str]]]:
+    """Parse tunnel-table JSON rows for a single DCGW `node` (see `dci_tunnels`)."""
+    res: dict[str, dict[str, list[str]]] = {}
+    for r in rows:
+        if not _fcli_node_matches(r.get("Node"), node):
             continue
-        cells = [c.strip() for c in line.split("|")]
-        if len(cells) < 4:
+        prefix, ttype = r.get("Prefix"), r.get("type")
+        if not prefix or not str(prefix).endswith("/32") or ttype not in WAN_TRANSPORTS:
             continue
-        prefix, ttype = cells[1], cells[2]
-        if not prefix.endswith("/32") or ttype not in WAN_TRANSPORTS:
-            continue
-        port = cells[-1] or cells[-2]          # trailing '|' yields an empty last cell
-        res.setdefault(prefix, {})[ttype] = port
+        ports = [str(p) for p in (r.get("egress-itf") or []) if p]
+        res.setdefault(prefix, {})[ttype] = ports
     return res
+
+
+def dci_tunnels(node: str) -> dict[str, dict[str, list[str]]]:
+    """IPv4 tunnel-table on `node`, via `fcli tunnel-table` (one gNMI query).
+
+    Returns {loopback-prefix: {transport: [egress-port, ...]}} for the
+    ldp/sr-isis tunnels. fcli resolves each tunnel's next-hop-group to the
+    egress sub-interface(s), so an ECMP tunnel lists every egress port.
+    """
+    return _tunnels_from_rows(
+        fcli_json(["tunnel-table"], inv=f"hostname={node}"), node
+    )
 
 
 # SR-ISIS underlay config lines (per node; the node-SID index is substituted).
@@ -293,20 +304,87 @@ def enable_wan_transport(transport: str):
 # counters) still use docker exec because fcli has no notion of them.
 # --------------------------------------------------------------------------- #
 
-def fcli_json(report_args: list[str], timeout: int = 90) -> list[dict]:
-    """Run an fcli report fabric-wide and return parsed JSON rows. Skips the
-    calling test gracefully if fcli is unavailable or the query fails."""
-    if shutil.which("fcli") is None:
-        pytest.skip("fcli not installed - skipping fabric-wide fcli check")
-    cmd = ["fcli", "-t", str(CLAB_TOPO), "-o", "json", *report_args]
+# fcli (the SR Linux fabric CLI from github.com/srl-labs/nornir-srl) is a hard
+# prerequisite for this suite - it is the reporting tool used for every fabric-
+# wide control-plane / RIB / tunnel / counter assertion. It is NOT a pip
+# dependency; install it as a standalone tool with `uv`.
+#
+# Minimum version: 0.4.3 is the first release that ships the `tunnel-table`
+# report (and the cumulative `ifstats` counters / cleaned JSON keys) this suite
+# relies on. Install from upstream (the fork's default branch may lag behind).
+FCLI_MIN_VERSION = "0.4.3"
+FCLI_INSTALL_HINT = (
+    f"fcli (nornir-srl) >= {FCLI_MIN_VERSION} is REQUIRED to run this suite "
+    "(it provides the tunnel-table report).\n"
+    "Install/upgrade it with uv:\n"
+    "    uv tool install --force git+https://github.com/srl-labs/nornir-srl\n"
+    "then make sure the uv tools bin dir (typically ~/.local/bin) is on your PATH.\n"
+    "(If you don't have uv: https://docs.astral.sh/uv/getting-started/installation/)"
+)
+
+
+def fcli_available() -> bool:
+    return shutil.which("fcli") is not None
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Numeric components of a dotted version string ('0.4.3' -> (0, 4, 3)).
+
+    Stops at the first non-numeric component so pre-release suffixes (e.g.
+    '0.4.3rc1') compare by their leading release number.
+    """
+    parts: list[int] = []
+    for comp in str(v).strip().split("."):
+        m = re.match(r"\d+", comp)
+        if not m:
+            break
+        parts.append(int(m.group()))
+    return tuple(parts)
+
+
+def fcli_version() -> str | None:
+    """The installed fcli version (e.g. '0.4.3'), or None if it can't be read."""
+    if not fcli_available():
+        return None
+    r = _run(["fcli", "--version"], timeout=30)
+    m = re.search(r"\d+\.\d+(?:\.\d+)?", (r.stdout or "") + (r.stderr or ""))
+    return m.group() if m else None
+
+
+def fcli_json(report_args: list[str], timeout: int = 90,
+              inv: str | None = None) -> list[dict]:
+    """Run an fcli report fabric-wide and return parsed JSON rows.
+
+    `inv` is an optional inventory filter (e.g. ``hostname=dcgw1`` or
+    ``role=dcgw``) passed as the global ``-i`` option so the query (and any
+    sampling, as in `ifstats`) is scoped to just those nodes.
+
+    fcli is a prerequisite (see `FCLI_INSTALL_HINT`): a missing tool or a failed
+    query is a hard error rather than a skip, so fabric problems surface."""
+    if not fcli_available():
+        pytest.fail(FCLI_INSTALL_HINT, pytrace=False)
+    cmd = ["fcli", "-t", str(CLAB_TOPO), "-o", "json"]
+    if inv:
+        cmd += ["-i", inv]
+    cmd += list(report_args)
     r = _run(cmd, timeout=timeout)
-    if r.returncode != 0 or not (r.stdout or "").strip():
-        pytest.skip(f"fcli '{' '.join(report_args)}' failed: "
-                    f"{(r.stderr or r.stdout or '').strip()[:200]}")
+    if r.returncode != 0:
+        pytest.fail(f"fcli '{' '.join(report_args)}' failed (rc={r.returncode}): "
+                    f"{(r.stderr or r.stdout or '').strip()[:300]}", pytrace=False)
+    out = (r.stdout or "").strip()
+    if not out or out == "No data...":
+        return []
     try:
-        return json.loads(r.stdout)
+        return json.loads(out)
     except json.JSONDecodeError:
-        pytest.skip(f"fcli '{' '.join(report_args)}' returned non-JSON output")
+        pytest.fail(f"fcli '{' '.join(report_args)}' returned non-JSON output: "
+                    f"{out[:300]}", pytrace=False)
+
+
+def _fcli_node_matches(value: str | None, node: str) -> bool:
+    """True when an fcli `Node` column value refers to topology node `node`
+    (prefix-agnostic, mirroring `cname`)."""
+    return bool(value) and (value == node or value.endswith(f"-{node}"))
 
 
 def l3dci_ipv4_rib() -> list[dict]:
@@ -317,6 +395,46 @@ def l3dci_ipv4_rib() -> list[dict]:
     cannot hide behind a better path.
     """
     return [r for r in fcli_json(["ipv4-rib"]) if r.get("NI") == L3DCI_NI]
+
+
+@functools.lru_cache(maxsize=1)
+def fcli_bgp_rib_l3vpn_v4_available() -> bool:
+    """True when ``fcli bgp-rib -r l3vpn-v4`` works (nornir-srl with L3VPN RIB support).
+
+    Older fcli builds lack this report mode; callers should skip rather than fail
+    the whole suite so ``tunnel-table``-only installs still run the rest.
+    """
+    if not fcli_available():
+        return False
+    cmd = ["fcli", "-t", str(CLAB_TOPO), "-o", "json", "bgp-rib", "-r", "l3vpn-v4"]
+    r = _run(cmd, timeout=90)
+    if r.returncode != 0:
+        return False
+    comb = ((r.stderr or "") + (r.stdout or "")).lower()
+    if "bad jmespath" in comb or ("invalid" in comb and "jmespath" in comb):
+        return False
+    return True
+
+
+def l3vpn_ipv4_rib_wan() -> list[dict]:
+    """Fabric-wide L3VPN IPv4 BGP RIB in the WAN instance (``default`` NI).
+
+    Rows come from ``fcli bgp-rib -r l3vpn-v4``; each includes ``Pfx`` (prefix),
+    ``RD``, ``st`` (used/valid/best markers), ``next-hop``, etc. Leaves without
+    an l3vpn-ipv4-unicast path are omitted by fcli (empty per host).
+    """
+    return [r for r in fcli_json(["bgp-rib", "-r", "l3vpn-v4"]) if r.get("NI") == WAN_VPNV4_NI]
+
+
+def remote_l3dci_subnet(dc: int) -> str:
+    """The other DC's L3 DCI tenant /24 as advertised over the WAN."""
+    return L3DCI_SUBNET_DC2 if dc == 1 else L3DCI_SUBNET_DC1
+
+
+def remote_dcgw_loopback_ips(dc: int) -> set[str]:
+    """system0 loopbacks of the DCGW pair in the *other* DC (WAN next-hops)."""
+    peers = DC2_DCGWS if dc == 1 else DC1_DCGWS
+    return {DCGW_SYS0[p] for p in peers}
 
 
 # --------------------------------------------------------------------------- #
@@ -465,13 +583,18 @@ def run_flows(flows: list[tuple[str, str]], bitrate: str = "3M",
 
 
 def dcgw_dci_out_packets(node: str) -> int:
-    """Total packets a DCGW has forwarded out of its DCI-facing ports."""
+    """Total packets a DCGW has forwarded out of its DCI-facing ports.
+
+    Uses `fcli ifstats` (cumulative `out-pkts` counter), scoped to `node` via
+    the inventory filter so only that gateway is sampled. A short sample
+    interval keeps the snapshot quick; only the cumulative total is used here.
+    """
     total = 0
-    for port in DCGW_DCI_PORTS:
-        out = srl(node, f"info from state interface {port} statistics out-packets")
-        m = re.search(r"out-packets\s+(\d+)", out)
-        if m:
-            total += int(m.group(1))
+    for r in fcli_json(["ifstats", "-s", "1"], inv=f"hostname={node}"):
+        if not _fcli_node_matches(r.get("Node"), node):
+            continue
+        if r.get("interface") in DCGW_DCI_PORTS:
+            total += int(r.get("out-pkts", 0) or 0)
     return total
 
 
@@ -484,9 +607,13 @@ def all_dcgws_meshed() -> bool:
     an unrestored transport stays invisible to end-to-end pings. This control-
     plane check catches both, so a botched teardown surfaces instead of silently
     leaving the lab degraded.
+
+    Uses one fabric-wide ``tunnel-table`` snapshot and filters per node, so
+    `wait_until_healthy` does not issue four separate fcli calls per poll iteration.
     """
+    rows = fcli_json(["tunnel-table"])
     for node in ALL_DCGWS:
-        tunnels = dci_tunnels(node)
+        tunnels = _tunnels_from_rows(rows, node)
         for loopback in remote_dcgw_loopbacks(node):
             row = tunnels.get(f"{loopback}/32", {})
             if not all(t in row for t in WAN_TRANSPORTS):
@@ -516,8 +643,28 @@ def wait_until_healthy(timeout: float = 180.0, settle: int = 2) -> bool:
 # --------------------------------------------------------------------------- #
 
 @pytest.fixture(scope="session", autouse=True)
-def lab_ready():
-    """Skip the whole suite early if the lab is not deployed."""
+def require_fcli():
+    """Hard prerequisite: fcli >= FCLI_MIN_VERSION must be on PATH (install via
+    uv) - the suite uses it for all fabric-wide reporting and needs the
+    tunnel-table report. Stop the whole session with install/upgrade
+    instructions if it is missing or too old, rather than silently skipping."""
+    if not fcli_available():
+        pytest.exit(FCLI_INSTALL_HINT, returncode=1)
+    ver = fcli_version()
+    if ver is None or _version_tuple(ver) < _version_tuple(FCLI_MIN_VERSION):
+        pytest.exit(
+            f"fcli {ver or '(version unknown)'} is too old: this suite requires "
+            f">= {FCLI_MIN_VERSION} for the tunnel-table report.\n\n"
+            + FCLI_INSTALL_HINT,
+            returncode=1,
+        )
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def lab_ready(require_fcli):
+    """Skip the whole suite early if the lab is not deployed (after confirming
+    the fcli prerequisite, so a missing tool surfaces its install hint first)."""
     clients = ["mh-dc1", "mh-dc2", "sh-dc1", "sh-dc2", "mh-dc1b", "mh-dc2b"]
     missing = [n for n in ALL_DCGWS + clients
                if cname(n) not in _docker_names()]

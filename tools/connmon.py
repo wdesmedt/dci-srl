@@ -512,7 +512,7 @@ def preflight(flows: list[Flow]):
     missing = sorted(c for c in need if c not in have)
     if missing:
         sys.exit(f"client containers not running: {missing}\n"
-                 f"deploy the lab first: containerlab deploy -t dci-without-eda.clab.yaml")
+                 f"deploy the lab first: containerlab deploy -t dci-srl.clab.yaml")
 
 
 def main():
