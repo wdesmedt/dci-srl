@@ -285,11 +285,21 @@ L3_FLOWS = [
     ("mh1-l3b", "sh2-l3"),    # MH -> SH
 ]
 
+# A flow's FIRST packet can be lost while the fabric resolves ARP and (re-)installs
+# the EVPN-IFL host route - on a multi-homed ES the /32 is originated by whichever
+# leaf holds the dynamic ARP entry, so it is re-originated when that ownership moves.
+# Each connectivity check therefore sends a discarded warm-up ping and asserts zero
+# loss only on the measured run (same rationale as the warm-up in
+# test_l3_host_route_scoped_to_local_dc). A genuine break still fails: it shows up as
+# sustained/100% loss on the measured ping.
+WARMUP_COUNT = 2
+
 
 @pytest.mark.connectivity
 @pytest.mark.parametrize("src,dst", L2_FLOWS, ids=[f"{s}->{d}" for s, d in L2_FLOWS])
 def test_l2_dci_connectivity(src, dst):
     """L2 DCI: stretched bridge-domain reachability across both DCs."""
+    ping(ENDPOINTS[src], ENDPOINTS[dst].ip, count=WARMUP_COUNT)   # discarded
     res = ping(ENDPOINTS[src], ENDPOINTS[dst].ip, count=5)
     assert res.loss_pct == 0.0, f"{src}->{dst} loss={res.loss_pct}%"
 
@@ -298,6 +308,7 @@ def test_l2_dci_connectivity(src, dst):
 @pytest.mark.parametrize("src,dst", L3_FLOWS, ids=[f"{s}->{d}" for s, d in L3_FLOWS])
 def test_l3_dci_connectivity(src, dst):
     """L3 DCI: routed inter-subnet reachability across both DCs."""
+    ping(ENDPOINTS[src], ENDPOINTS[dst].ip, count=WARMUP_COUNT)   # discarded
     res = ping(ENDPOINTS[src], ENDPOINTS[dst].ip, count=5)
     assert res.loss_pct == 0.0, f"{src}->{dst} loss={res.loss_pct}%"
 
