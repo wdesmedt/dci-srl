@@ -1,3 +1,11 @@
+set / bfd subinterface ethernet-1/1.0 admin-state enable
+set / bfd subinterface ethernet-1/1.0 desired-minimum-transmit-interval 1000000
+set / bfd subinterface ethernet-1/1.0 required-minimum-receive 1000000
+set / bfd subinterface ethernet-1/1.0 detection-multiplier 3
+set / bfd subinterface ethernet-1/2.0 admin-state enable
+set / bfd subinterface ethernet-1/2.0 desired-minimum-transmit-interval 1000000
+set / bfd subinterface ethernet-1/2.0 required-minimum-receive 1000000
+set / bfd subinterface ethernet-1/2.0 detection-multiplier 3
 set / interface ethernet-1/1 description dcgw3-to-spine3
 set / interface ethernet-1/1 admin-state enable
 set / interface ethernet-1/1 subinterface 0 admin-state enable
@@ -136,6 +144,8 @@ set / network-instance default protocols bgp route-advertisement wait-for-fib-in
 set / network-instance default protocols bgp group dc-fabric admin-state enable
 set / network-instance default protocols bgp group dc-fabric export-policy [ dcgw-dc-export-dc2 ]
 set / network-instance default protocols bgp group dc-fabric import-policy [ dcgw-dc-import-dc2 ]
+set / network-instance default protocols bgp group dc-fabric failure-detection enable-bfd true
+set / network-instance default protocols bgp group dc-fabric failure-detection fast-failover true
 set / network-instance default protocols bgp group dc-fabric afi-safi evpn admin-state enable
 set / network-instance default protocols bgp group dc-fabric afi-safi ipv4-unicast admin-state enable
 set / network-instance default protocols bgp group dc-fabric afi-safi ipv4-unicast ipv4-unicast advertise-ipv6-next-hops true

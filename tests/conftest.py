@@ -232,15 +232,16 @@ def set_ports(node: str, ports: list[str], state: str):
 # --------------------------------------------------------------------------- #
 
 def _tunnels_from_rows(rows: list[dict], node: str) -> dict[str, dict[str, list[str]]]:
-    """Parse tunnel-table JSON rows for a single DCGW `node` (see `dci_tunnels`)."""
+    """Parse flattened tunnel-table rows for a single DCGW `node` (see `dci_tunnels`)."""
     res: dict[str, dict[str, list[str]]] = {}
     for r in rows:
-        if not _fcli_node_matches(r.get("Node"), node):
+        if not _fcli_node_matches(r.get("node"), node):
             continue
-        prefix, ttype = r.get("Prefix"), r.get("type")
+        prefix, ttype = r.get("prefix"), r.get("type")
         if not prefix or not str(prefix).endswith("/32") or ttype not in WAN_TRANSPORTS:
             continue
-        ports = [str(p) for p in (r.get("egress-itf") or []) if p]
+        ports = [str(nh["subinterface"]) for nh in (r.get("next_hops") or [])
+                 if nh.get("subinterface")]
         res.setdefault(prefix, {})[ttype] = ports
     return res
 
@@ -253,7 +254,7 @@ def dci_tunnels(node: str) -> dict[str, dict[str, list[str]]]:
     egress sub-interface(s), so an ECMP tunnel lists every egress port.
     """
     return _tunnels_from_rows(
-        fcli_json(["tunnel-table"], inv=f"hostname={node}"), node
+        fcli_rows(["tunnel-table"], "tunnels", inv=f"hostname={node}"), node
     )
 
 
@@ -304,20 +305,22 @@ def enable_wan_transport(transport: str):
 # counters) still use docker exec because fcli has no notion of them.
 # --------------------------------------------------------------------------- #
 
-# fcli (the SR Linux fabric CLI from github.com/srl-labs/nornir-srl) is a hard
+# fcli (the SR Linux fabric CLI from github.com/srl-labs/fcli) is a hard
 # prerequisite for this suite - it is the reporting tool used for every fabric-
 # wide control-plane / RIB / tunnel / counter assertion. It is NOT a pip
 # dependency; install it as a standalone tool with `uv`.
 #
-# Minimum version: 0.4.3 is the first release that ships the `tunnel-table`
-# report (and the cumulative `ifstats` counters / cleaned JSON keys) this suite
-# relies on. Install from upstream (the fork's default branch may lag behind).
-FCLI_MIN_VERSION = "0.4.3"
+# Minimum version: since 0.7.0 `-o json` emits typed records (one entry per
+# node/network-instance with the table rows nested under it, snake_case keys),
+# and 0.9.0 added `bgp-rib --all` (every received path, not only the used ones),
+# which the leak checks rely on. Older builds emit flat table rows with
+# column-title keys that this suite no longer parses.
+FCLI_MIN_VERSION = "0.9.0"
 FCLI_INSTALL_HINT = (
-    f"fcli (nornir-srl) >= {FCLI_MIN_VERSION} is REQUIRED to run this suite "
-    "(it provides the tunnel-table report).\n"
+    f"fcli >= {FCLI_MIN_VERSION} is REQUIRED to run this suite "
+    "(structured JSON records and `bgp-rib --all`).\n"
     "Install/upgrade it with uv:\n"
-    "    uv tool install --force git+https://github.com/srl-labs/nornir-srl\n"
+    "    uv tool install --force git+https://github.com/srl-labs/fcli\n"
     "then make sure the uv tools bin dir (typically ~/.local/bin) is on your PATH.\n"
     "(If you don't have uv: https://docs.astral.sh/uv/getting-started/installation/)"
 )
@@ -353,7 +356,7 @@ def fcli_version() -> str | None:
 
 def fcli_json(report_args: list[str], timeout: int = 90,
               inv: str | None = None) -> list[dict]:
-    """Run an fcli report fabric-wide and return parsed JSON rows.
+    """Run an fcli report fabric-wide and return its parsed JSON records.
 
     `inv` is an optional inventory filter (e.g. ``hostname=dcgw1`` or
     ``role=dcgw``) passed as the global ``-i`` option so the query (and any
@@ -381,8 +384,23 @@ def fcli_json(report_args: list[str], timeout: int = 90,
                     f"{out[:300]}", pytrace=False)
 
 
+def fcli_rows(report_args: list[str], items: str, timeout: int = 90,
+              inv: str | None = None) -> list[dict]:
+    """Run an fcli report and flatten its records into one dict per table row.
+
+    fcli emits one record per node (and network-instance) with the rows nested
+    under a list field - `neighbors` for bgp-peers, `routes` for the RIBs,
+    `tunnels` for tunnel-table. Each returned row is a nested item merged with
+    its record's scalar fields (`node`, `ni`, ...)."""
+    rows: list[dict] = []
+    for rec in fcli_json(report_args, timeout=timeout, inv=inv):
+        parent = {k: v for k, v in rec.items() if k != items}
+        rows.extend({**parent, **item} for item in rec.get(items) or [])
+    return rows
+
+
 def _fcli_node_matches(value: str | None, node: str) -> bool:
-    """True when an fcli `Node` column value refers to topology node `node`
+    """True when an fcli `node` value refers to topology node `node`
     (prefix-agnostic, mirroring `cname`)."""
     return bool(value) and (value == node or value.endswith(f"-{node}"))
 
@@ -390,16 +408,17 @@ def _fcli_node_matches(value: str | None, node: str) -> bool:
 def l3dci_ipv4_rib() -> list[dict]:
     """Fabric-wide IPv4 RIB rows for the L3-DCI IP-VRF (`fcli ipv4-rib`).
 
-    Each row: {Node, NI, Prefix, next-hop[], type, Act(yes|no), metric, pref, itf[]}.
-    Includes non-best paths (Act=no), so a host-route that leaked across the DCI
-    cannot hide behind a better path.
+    Each row: {node, ni, prefix, type, active, metric, preference, next_hops[]},
+    where every next-hop has an `address` and `egress` entries (`kind`, `value`,
+    `tunnel` = vxlan | ldp | sr-isis | ...). Includes inactive routes, so a
+    host-route that leaked across the DCI cannot hide behind a better path.
     """
-    return [r for r in fcli_json(["ipv4-rib"]) if r.get("NI") == L3DCI_NI]
+    return [r for r in fcli_rows(["ipv4-rib"], "routes") if r.get("ni") == L3DCI_NI]
 
 
 @functools.lru_cache(maxsize=1)
 def fcli_bgp_rib_l3vpn_v4_available() -> bool:
-    """True when ``fcli bgp-rib -r l3vpn-v4`` works (nornir-srl with L3VPN RIB support).
+    """True when ``fcli bgp-rib -r l3vpn-v4`` works (fcli with L3VPN RIB support).
 
     Older fcli builds lack this report mode; callers should skip rather than fail
     the whole suite so ``tunnel-table``-only installs still run the rest.
@@ -419,11 +438,13 @@ def fcli_bgp_rib_l3vpn_v4_available() -> bool:
 def l3vpn_ipv4_rib_wan() -> list[dict]:
     """Fabric-wide L3VPN IPv4 BGP RIB in the WAN instance (``default`` NI).
 
-    Rows come from ``fcli bgp-rib -r l3vpn-v4``; each includes ``Pfx`` (prefix),
-    ``RD``, ``st`` (used/valid/best markers), ``next-hop``, etc. Leaves without
-    an l3vpn-ipv4-unicast path are omitted by fcli (empty per host).
+    Rows come from ``fcli bgp-rib -r l3vpn-v4 --all`` (every received path, not
+    only the used ones); each includes ``prefix``, ``rd``, ``used`` / ``valid`` /
+    ``best``, ``next_hop``, etc. Nodes without an l3vpn-ipv4-unicast path have no
+    record.
     """
-    return [r for r in fcli_json(["bgp-rib", "-r", "l3vpn-v4"]) if r.get("NI") == WAN_VPNV4_NI]
+    return [r for r in fcli_rows(["bgp-rib", "-r", "l3vpn-v4", "--all"], "routes")
+            if r.get("ni") == WAN_VPNV4_NI]
 
 
 def remote_l3dci_subnet(dc: int) -> str:
@@ -585,16 +606,16 @@ def run_flows(flows: list[tuple[str, str]], bitrate: str = "3M",
 def dcgw_dci_out_packets(node: str) -> int:
     """Total packets a DCGW has forwarded out of its DCI-facing ports.
 
-    Uses `fcli ifstats` (cumulative `out-pkts` counter), scoped to `node` via
+    Uses `fcli ifstats` (cumulative `out_packets` counter), scoped to `node` via
     the inventory filter so only that gateway is sampled. A short sample
     interval keeps the snapshot quick; only the cumulative total is used here.
     """
     total = 0
     for r in fcli_json(["ifstats", "-s", "1"], inv=f"hostname={node}"):
-        if not _fcli_node_matches(r.get("Node"), node):
+        if not _fcli_node_matches(r.get("node"), node):
             continue
-        if r.get("interface") in DCGW_DCI_PORTS:
-            total += int(r.get("out-pkts", 0) or 0)
+        if r.get("name") in DCGW_DCI_PORTS:
+            total += int(r.get("out_packets", 0) or 0)
     return total
 
 
@@ -611,7 +632,7 @@ def all_dcgws_meshed() -> bool:
     Uses one fabric-wide ``tunnel-table`` snapshot and filters per node, so
     `wait_until_healthy` does not issue four separate fcli calls per poll iteration.
     """
-    rows = fcli_json(["tunnel-table"])
+    rows = fcli_rows(["tunnel-table"], "tunnels")
     for node in ALL_DCGWS:
         tunnels = _tunnels_from_rows(rows, node)
         for loopback in remote_dcgw_loopbacks(node):
@@ -645,8 +666,8 @@ def wait_until_healthy(timeout: float = 180.0, settle: int = 2) -> bool:
 @pytest.fixture(scope="session", autouse=True)
 def require_fcli():
     """Hard prerequisite: fcli >= FCLI_MIN_VERSION must be on PATH (install via
-    uv) - the suite uses it for all fabric-wide reporting and needs the
-    tunnel-table report. Stop the whole session with install/upgrade
+    uv) - the suite uses it for all fabric-wide reporting and parses its
+    structured JSON records. Stop the whole session with install/upgrade
     instructions if it is missing or too old, rather than silently skipping."""
     if not fcli_available():
         pytest.exit(FCLI_INSTALL_HINT, returncode=1)
@@ -654,7 +675,7 @@ def require_fcli():
     if ver is None or _version_tuple(ver) < _version_tuple(FCLI_MIN_VERSION):
         pytest.exit(
             f"fcli {ver or '(version unknown)'} is too old: this suite requires "
-            f">= {FCLI_MIN_VERSION} for the tunnel-table report.\n\n"
+            f">= {FCLI_MIN_VERSION} for its structured JSON output.\n\n"
             + FCLI_INSTALL_HINT,
             returncode=1,
         )
@@ -675,18 +696,21 @@ def lab_ready(require_fcli):
 
 @pytest.fixture(scope="session")
 def bgp_peers_fabric() -> list[dict]:
-    """Fabric-wide BGP neighbor state (one fcli query, shared by the suite)."""
-    return fcli_json(["bgp-peers"])
+    """Fabric-wide BGP neighbor state, one row per neighbor (one fcli query,
+    shared by the suite). Each row carries `node`, `peer`, `group`, `state` and
+    `families` [{name, enabled, oper, received, active, sent}]."""
+    return fcli_rows(["bgp-peers"], "neighbors")
 
 
 @pytest.fixture(scope="session")
 def evpn_nexthops_by_node() -> dict[str, dict[int, set[str]]]:
     """Fabric-wide EVPN next-hops grouped by node and route type
-    (2=MAC/IP, 3=inclusive-multicast, 5=IP-prefix), collected via fcli."""
+    (2=MAC/IP, 3=inclusive-multicast, 5=IP-prefix), collected via fcli over
+    every received path (`--all`), so a leaked non-best route cannot hide."""
     by_node: dict[str, dict[int, set[str]]] = {}
     for rt in (2, 3, 5):
-        for row in fcli_json(["bgp-rib", "-r", "evpn", "-t", str(rt)]):
-            node, nh = row.get("Node"), row.get("next-hop")
+        for row in fcli_rows(["bgp-rib", "-r", "evpn", "-t", str(rt), "--all"], "routes"):
+            node, nh = row.get("node"), row.get("next_hop")
             if node and nh:
                 by_node.setdefault(node, {}).setdefault(rt, set()).add(nh)
     return by_node

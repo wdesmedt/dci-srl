@@ -54,3 +54,5 @@ coverage.xml
 .env
 .env.*
 !.env.example
+#---
+*.log

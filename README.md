@@ -264,56 +264,123 @@ Give the fabric ~2–3 minutes to converge (eBGP, IS-IS/LDP, iBGP, EVPN, then cl
 bootstrap). Inspect a node with `ssh admin@leaf1` (password
 `NokiaSrl1!`).
 
+Then start the [`fcli` server](#interactive-validation-with-the-fcli-server) so the
+fabric-wide validation views are live in a browser while you work through the steps below:
+
+```bash
+fcli -t dci-srl.clab.yaml server -d -L 0.0.0.0 -P 8080   # then open http://localhost:8080
+```
+
 ---
 
 ## Validation
 
-### Preferred reporting tool: `fcli` (fabric-wide)
+### Interactive validation with the `fcli` server
 
-For any check that asks "**is this true across the fabric?**" — BGP sessions, the EVPN
-RIB, VXLAN tunnels, MAC/ARP tables, Ethernet-Segments, LAGs, interface rates — use
-[`fcli`](https://github.com/srl-labs/nornir-srl) (the SR Linux fabric CLI) rather than
-SSH-ing into each node. One `fcli` call fans out a single gNMI query to **all 18 SR Linux
-nodes** (8 leaves, 4 spines, 4 DCGWs, 2 P routers) and returns one consolidated table, so
-you see the whole fabric at a glance instead of scraping `show ...` on 18 boxes.
+For any check that asks "**is this true across the fabric?**" — BGP and BFD sessions, the
+EVPN and VPN-IPv4 RIBs, VXLAN and MPLS tunnels, MAC/ARP tables, Ethernet-Segments, LAGs,
+interface rates — use [`fcli`](https://github.com/srl-labs/fcli) (the SR Linux fabric CLI)
+rather than SSH-ing into each node. It covers **all 18 SR Linux nodes** (8 leaves,
+4 spines, 4 DCGWs, 2 P routers) in one consolidated view.
+
+For interactive validation, run `fcli` as a **server**. It keeps gNMI subscriptions open
+to every node and serves live, auto-refreshing report tables in a browser, so you can keep
+the relevant view open while you inject a fault and watch the fabric react, instead of
+re-running commands:
 
 ```bash
-# Scope to a subset with the inventory filter (-i) using the topology labels:
-#   role = leaf | spine | dcgw | pe        site = dc1 | dc2 | wan
+fcli -t dci-srl.clab.yaml server -d -L 0.0.0.0 -P 8080   # -d: background, logs to ./fcli-server.log
+# open http://localhost:8080   (use another -P if 8080 is taken)
+pkill -f 'fcli -t dci-srl.clab.yaml server'              # stop it
+```
+
+Beyond the per-feature reports, the server adds views built for validating this design:
+
+- **Incidents** — every sanity check's findings grouped by root cause (a link that went
+  down together with the BGP/BFD/IGP sessions over it), worst first. **Start here**: on a
+  healthy lab only expected noise remains (see below).
+- **Changes** — a timeline of what changed and when: sessions, ports, LLDP, BFD and IGP
+  adjacencies, DF elections, MAC moves, route counts. Keep it open during a failover test.
+- **Path** — walks the route tables hop by hop from a node or address to a destination,
+  through every ECMP branch and tunnel: VXLAN to the DCGW, MPLS across the DCI, VXLAN again
+  in the remote DC. The quickest way to see which DCGWs and which WAN path a flow takes.
+- **Where** / **Service** — find which nodes know a MAC or IP, and see one MAC-VRF/IP-VRF
+  (EVI, VNI, route-targets, VTEP peers, ES) as every node that carries it sees it.
+- **Baselines** — keep the fabric as it is now and later show what drifted from it.
+
+Every view is a URL, so a check can be bookmarked or shared. The fragment is
+`#<report>?<param>=<value>&node=<n1>,<n2>`; the links in the steps below assume
+`http://localhost:8080`. The browser also accepts an inventory filter using the topology
+labels (`role = leaf | spine | dcgw | pe`, `site = dc1 | dc2 | wan`).
+
+| Want to verify | Server view | One-shot CLI | Notes |
+|----------------|-------------|--------------|-------|
+| Overall health | [Incidents](http://localhost:8080/#incidents) | `incidents` | grouped findings, worst first; exits non-zero on errors |
+| Underlay + overlay BGP up | [BGP Peers](http://localhost:8080/#bgp_peers) | `bgp-peers` | eBGP fabric + iBGP WAN; all `established`, per-AF received / active / sent |
+| BFD on the DC fabric | [BFD Sessions](http://localhost:8080/#bfd) | `bfd` | leaf↔spine and spine↔DCGW sessions `up`, with failure counts |
+| EVPN control plane | [EVPN type 2](http://localhost:8080/#bgp_rib_evpn_2) / [type 5](http://localhost:8080/#bgp_rib_evpn_5) | `bgp-rib -r evpn -t 2\|5` | fabric-wide route/next-hop view |
+| WAN VPN-IPv4 routes | [L3VPN IPv4](http://localhost:8080/#bgp_rib_l3vpn_v4?node=dcgw1,dcgw2,dcgw3,dcgw4) | `bgp-rib -r l3vpn-v4` | re-originated prefixes on the DCGWs |
+| VXLAN tunnels / VTEPs | [VXLAN Tunnels](http://localhost:8080/#vxlan) | `vxlan` | per-leaf VTEP unicast destinations |
+| L2 / L3 services | [Services](http://localhost:8080/#services), [MAC Table](http://localhost:8080/#mac), [IRB](http://localhost:8080/#irb), [ARP](http://localhost:8080/#arp) | `ni`, `mac`, `irb`, `arp` | stretched BD-A/BD-B, IP-VRF, anycast IRB, IFL `/32`s |
+| Multi-homing | [Ethernet Segments](http://localhost:8080/#es), [LAGs](http://localhost:8080/#lag) | `es`, `es-dest`, `lag` | all-active ES state + LACP bundles |
+| WAN IGP | [IS-IS Adjacencies](http://localhost:8080/#isis?node=dcgw1,dcgw2,dcgw3,dcgw4,p1,p2) | `-i site=wan isis` | adjacencies across the DCGW mesh and the P core |
+| MPLS transport / tunnels | [Tunnel Table](http://localhost:8080/#tunnel_table?node=dcgw1,dcgw2,dcgw3,dcgw4) | `tunnel-table` | parallel LDP vs SR-ISIS tunnels + egress port/labels |
+| End-to-end forwarding | [Path](http://localhost:8080/#path?source=leaf1&destination=10.200.2.23&ni=ipvrf-l3dci) | `path leaf1 10.200.2.23 --ni ipvrf-l3dci` | leaf → DCGW pair → MPLS → remote DCGW pair → leaf |
+| Live link rates / counters | [Interface Stats](http://localhost:8080/#ifstats) | `ifstats -s 10` | per-interface in/out bps **and** cumulative pkts/octets |
+
+**One-shot CLI.** Every view is also a plain command that does a single gNMI read and
+prints a table, handy for scripts and for the [pytest suite](#automated-validation-pytest):
+
+```bash
 fcli -t dci-srl.clab.yaml bgp-peers                 # all nodes
 fcli -t dci-srl.clab.yaml -i role=dcgw bgp-peers    # just the four DCGWs
 fcli -t dci-srl.clab.yaml -o json vxlan | jq .      # machine-readable
+fcli -t dci-srl.clab.yaml history -s 30m            # the running server's change timeline
 ```
 
-| Want to verify | `fcli` command | Notes |
-|----------------|----------------|-------|
-| Underlay + overlay BGP up | `bgp-peers` | eBGP fabric + iBGP WAN; all `established`. Table uses two-line AFI headers (e.g. **EVPN** / **R/A/T**); with ``-o json`` keys become ``EVPN R/A/T``, ``U4 R/A/T``, ``VPNv4 R/A/T``, … (received / active / sent per neighbor). |
-| EVPN control plane | `bgp-rib -r evpn` (`-t 2` MAC/IP, `-t 5` IP-prefix) | fabric-wide route/next-hop view |
-| VXLAN tunnels / VTEPs | `vxlan` | per-leaf VTEP unicast destinations |
-| L2 services + MACs | `ni -f Type=mac-vrf`, `mac` | stretched BD-A/BD-B reachability |
-| L3 services + hosts | `ni -f Type=ip-vrf`, `irb`, `ipv4-rib`, `arp` | IP-VRF, anycast IRB, IFL `/32`s |
-| Multi-homing | `es`, `es-dest`, `lag` | all-active ES state + LACP bundles |
-| WAN underlay | `-i site=wan lldp`, `ipv4-rib` | IS-IS/MPLS core adjacencies |
-| MPLS transport / tunnels | `tunnel-table` | parallel LDP vs SR-ISIS tunnels + egress port/labels |
-| Live link rates / counters | `ifstats -s 10` | per-interface in/out bps **and** cumulative pkts/octets |
+**Expected findings on a healthy lab.** *Incidents* still lists a few warnings that are
+side-effects of the design, not faults:
+
+- *BGP family without routes* on the DC fabric links: `ipv6-unicast` is enabled on the
+  underlay sessions, but only IPv4 loopbacks are advertised (with IPv6 next-hops).
+- *dcgw1 ↔ dcgw2* / *dcgw3 ↔ dcgw4 BGP family without routes*: each DCGW tags its WAN
+  exports with its DC's site-of-origin (`soo-dc1` / `soo-dc2`) and rejects that tag on WAN
+  import, so the two DCGWs of a DC deliberately drop each other's routes (loop prevention).
+- *Platform: resource running out* on every node: the containers report the **host's**
+  memory, so this tracks how loaded the lab host is.
 
 **When per-node `show` is better — and why the steps below still use it.** `fcli`
 reports SR Linux *state* models, but a few DCI-specific checks need detail it does not
 surface, so for those reach into a single node with `ssh admin@<node>`
 (or `docker exec -i <node> sr_cli`):
 
-- **MPLS transport / tunnel-table** — `fcli tunnel-table` now gives the fabric-wide view of
-  the parallel **LDP vs SR-ISIS** tunnels (preference, egress port, label stack); for the
-  per-node preference detail of sections 0, 3–5 you can still use
-  `show network-instance default tunnel-table all`.
-- **IS-IS adjacencies, LDP sessions, segment-routing / node-SIDs** — the WAN-core IGP and
-  label state (section 0, 5); `fcli` has no view of these.
+- **LDP sessions and segment-routing / node-SIDs** — the WAN-core label state (sections 0
+  and 5); `fcli` has no view of these. IS-IS adjacencies and the resulting tunnels *are*
+  covered (*IS-IS Adjacencies*, *Tunnel Table*).
 - **Service route-table specifics** — e.g. `show network-instance ipvrf-l3dci route-table
-  ipv4-unicast` to see which transport/next-hop a remote prefix resolved over.
+  ipv4-unicast` for every attribute of how a remote prefix resolved; *Path* covers the
+  hop-by-hop view.
 - **Making changes** — fault injection and restores (`enter candidate` / `commit now`) are
   config actions, not reporting; `fcli` is read-only.
 
-### 0. Fabric / DCI plane health (on any DCGW, e.g. `dcgw1`)
+### 0. Fabric / DCI plane health
+
+In the server, open [Incidents](http://localhost:8080/#incidents): only the expected
+findings listed above should remain. Then check
+[BGP Peers](http://localhost:8080/#bgp_peers) (every session `established`),
+[BFD Sessions](http://localhost:8080/#bfd) (all `up`),
+[IS-IS Adjacencies](http://localhost:8080/#isis?node=dcgw1,dcgw2,dcgw3,dcgw4,p1,p2) and
+the [Tunnel Table](http://localhost:8080/#tunnel_table?node=dcgw1,dcgw2,dcgw3,dcgw4)
+(an `ldp` and an `sr-isis` tunnel to every remote DCGW loopback).
+
+Before the fault-injection steps (3–5), take a baseline so you can later see exactly what
+a test changed and confirm the fabric returned to it:
+
+```bash
+fcli -t dci-srl.clab.yaml baseline healthy --note "steady state after deploy"
+```
+
+For the LDP and segment-routing state `fcli` doesn't cover, use any DCGW, e.g. `dcgw1`:
 
 ```
 show network-instance default protocols bgp neighbor          # dc-fabric (eBGP) + wan-ibgp (iBGP) Established
@@ -333,9 +400,13 @@ Stretched bridge-domain — a single subnet 10.100.0.0/24 across both DCs.
 docker exec mh-dc1 ip netns exec mh1-l2a ping 10.100.0.21
 docker exec sh-dc1 ip netns exec sh1-l2  ping 10.100.0.23
 ```
-On a DCGW: `show network-instance macvrf-l2dci bridge-table mac-table all` shows remote
-MACs reachable via the EVPN-MPLS (instance 2) next-hop, resolved over the **direct**
-mesh (low IS-IS metric).
+[Service `macvrf-l2dci`](http://localhost:8080/#service?name=macvrf-l2dci) shows the
+stretched BD on every leaf and DCGW that carries it, with local vs remote MAC counts and
+VTEP peers, and the [MAC Table](http://localhost:8080/#mac?node=dcgw1,dcgw2) shows the
+remote-DC MACs on the DC1 DCGWs. On a DCGW,
+`show network-instance macvrf-l2dci bridge-table mac-table all` shows those remote MACs
+reachable via the EVPN-MPLS (instance 2) next-hop, resolved over the **direct** mesh (low
+IS-IS metric).
 
 ### 2. L3 DCI over the DIRECT path
 
@@ -345,14 +416,21 @@ Different subnet per DC, routed across the DCI via `ipvrf-l3dci`.
 docker exec mh-dc1 ip netns exec mh1-l3a ping 10.200.2.21
 docker exec sh-dc1 ip netns exec sh1-l3  ping 10.200.2.23
 ```
-On a DCGW: `show network-instance ipvrf-l3dci route-table ipv4-unicast` shows the remote
-DC subnet learned via IP-VPN; `show network-instance default protocols bgp routes
-l3vpn-ipv4` shows the re-originated VPN-IPv4 prefixes.
+[Path leaf1 → 10.200.2.23](http://localhost:8080/#path?source=leaf1&destination=10.200.2.23&ni=ipvrf-l3dci)
+walks the whole route: VXLAN from `leaf1` to both DC1 DCGWs, MPLS across the direct mesh
+to `dcgw3`/`dcgw4`, then VXLAN to `leaf7`. Every ECMP branch is shown, so both gateways
+appear in each DC. [L3VPN IPv4](http://localhost:8080/#bgp_rib_l3vpn_v4?node=dcgw1,dcgw2,dcgw3,dcgw4)
+shows the re-originated VPN-IPv4 prefixes on the DCGWs. On a DCGW,
+`show network-instance ipvrf-l3dci route-table ipv4-unicast` shows the remote DC subnet
+learned via IP-VPN.
 
 ### 3 & 4. Same services over the WAN path
 
 Force traffic onto the P core by disabling the direct mesh on the DC1 DCGWs, then
-re-run the L2 and L3 pings — they keep working, now via `p1`/`p2`:
+re-run the L2 and L3 pings — they keep working, now via `p1`/`p2`. Keep
+[Changes](http://localhost:8080/#changes?since=15m) open in the server while you do this,
+so you can watch the mesh ports, IS-IS adjacencies and tunnels go down and the WAN path
+take over:
 
 ```bash
 # on dcgw1 and dcgw2
@@ -362,10 +440,17 @@ set / interface ethernet-1/4 admin-state disable
 set / interface ethernet-1/5 admin-state disable
 commit now
 ```
-Re-check `show network-instance default tunnel-table all` — the tunnels to the
-remote DCGW loopbacks now resolve via the `ethernet-1/6` / `ethernet-1/7` (P-facing)
-next-hops, and the same client pings/iperf3 still succeed. Re-enable the interfaces to
-return to the direct path.
+[Path dcgw1 → 10.200.2.23](http://localhost:8080/#path?source=dcgw1&destination=10.200.2.23&ni=ipvrf-l3dci)
+now leaves `dcgw1` on `ethernet-1/6` / `ethernet-1/7` towards `p1`/`p2` instead of
+`ethernet-1/3` / `ethernet-1/4` towards `dcgw3`/`dcgw4`. The
+[Tunnel Table](http://localhost:8080/#tunnel_table?node=dcgw1,dcgw2) (or
+`show network-instance default tunnel-table all`) shows the same move to the P-facing
+next-hops, and the client pings/iperf3 still succeed. Re-enable the interfaces to return to
+the direct path, then confirm nothing is left over:
+
+```bash
+fcli -t dci-srl.clab.yaml drift healthy   # exits non-zero if anything is still broken
+```
 
 ### 5. Per-transport validation: LDP vs SR-ISIS
 
@@ -373,8 +458,12 @@ Both MPLS transports run in parallel. `show network-instance default tunnel-tabl
 on a DCGW shows an **`ldp`** *and* an **`sr-isis`** tunnel to every remote loopback (the
 SR-ISIS tunnel label is `15000 + node-SID index`, e.g. `15152` for `dcgw2`). LDP is
 preferred (tunnel-table preference `9` vs SR-ISIS `11`), so steady-state traffic rides
-LDP. Disable one transport on **all six WAN nodes** (`dcgw1..4`, `p1`, `p2`) to prove the
-other carries every service on its own:
+LDP. The server's [Tunnel Table](http://localhost:8080/#tunnel_table?node=dcgw1,dcgw2,dcgw3,dcgw4)
+shows both tunnel types side by side, and
+[Path dcgw1 → 10.200.2.23](http://localhost:8080/#path?source=dcgw1&destination=10.200.2.23&ni=ipvrf-l3dci)
+names the transport in use (`ldp:192.0.3.153`, or `sr-isis:…` once LDP is off). Disable
+one transport on **all six WAN nodes** (`dcgw1..4`, `p1`, `p2`) to prove the other carries
+every service on its own:
 
 ```bash
 # --- Exercise SR-ISIS only: disable LDP on every WAN node ---
@@ -420,7 +509,7 @@ test that injects a fault restores the topology in teardown.
 The suite uses **`fcli`** for fabric-wide gNMI reports (`bgp-peers`, BGP RIBs including
 EVPN and—when supported—**L3VPN IPv4** in the WAN `default` instance, `ipv4-rib` in
 `ipvrf-l3dci`, `tunnel-table`, `ifstats`). Extra DCGW VPNv4 assertions are skipped
-automatically if `fcli bgp-rib -r l3vpn-v4` is not available (older nornir-srl builds).
+automatically if `fcli bgp-rib -r l3vpn-v4` is not available (older builds).
 
 ```bash
 cd tests
@@ -428,11 +517,12 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
 # fcli is a REQUIRED prerequisite (fabric-wide reporting over gNMI), not a pip
-# dependency. Needs >= 0.4.3 (first release with the tunnel-table report).
-# Optional: a current nornir-srl build adds `fcli bgp-rib -r l3vpn-v4` for WAN
-# VPNv4 RIB checks on DCGWs (the suite skips those if the mode is missing).
+# dependency. Needs >= 0.9.0: the suite parses its structured `-o json` records
+# (one entry per node with the rows nested under it, introduced in 0.7.0) and
+# uses `bgp-rib --all` (0.9.0) so leaked non-best paths cannot hide. The same
+# install also provides the `fcli server` used for interactive validation above.
 # Install it once as a standalone tool with uv (https://docs.astral.sh/uv/):
-uv tool install --force git+https://github.com/srl-labs/nornir-srl   # ensure ~/.local/bin is on PATH
+uv tool install --force git+https://github.com/srl-labs/fcli   # ensure ~/.local/bin is on PATH
 
 pytest -v                      # full suite (deploy the lab first)
 pytest -v -m connectivity      # steady-state + control-plane only (non-disruptive)
@@ -523,8 +613,8 @@ What the markers map to:
     (when `fcli bgp-rib -r l3vpn-v4` is available), and `test_remote_dest_via_local_dcgw` use **`fcli`**
     (fabric CLI) for fabric-wide BGP/RIB state in a single gNMI query — `fcli -o json
     bgp-peers` for session state **and** per-AFI received/active/sent counters (group-aware),
-    `fcli -o json bgp-rib -r evpn` for next-hops, and
-    `fcli -o json bgp-rib -r l3vpn-v4` for the WAN VPNv4 RIB on DCGWs —
+    `fcli -o json bgp-rib -r evpn --all` for next-hops, and
+    `fcli -o json bgp-rib -r l3vpn-v4 --all` for the WAN VPNv4 RIB on DCGWs —
     instead of per-node CLI scraping. The transport checks (`test_direct_path_preferred`,
     `test_wan_transports_both_present`, `test_wan_transport_failover`) likewise read
     `fcli -o json tunnel-table`, and the ECMP/​pinning tests read cumulative DCI-egress
